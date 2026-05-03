@@ -1,0 +1,6 @@
+services:
+  - type: worker
+    name: cargo-ai-crm-bot
+    env: docker
+    plan: free
+    autoDeploy: true
