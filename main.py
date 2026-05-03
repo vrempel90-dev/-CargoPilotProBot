@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import html
 import logging
 import os
@@ -350,10 +351,14 @@ def support_ticket_actions_keyboard(ticket_id: int, include_client_reply: bool =
     )
 
 
-async def get_db() -> aiosqlite.Connection:
+@asynccontextmanager
+async def get_db():
     db = await aiosqlite.connect(DB_PATH)
     db.row_factory = aiosqlite.Row
-    return db
+    try:
+        yield db
+    finally:
+        await db.close()
 
 
 
@@ -368,7 +373,7 @@ async def db_fetchall(db: aiosqlite.Connection, query: str, params: tuple = ()) 
     return await cur.fetchall()
 
 async def init_db() -> None:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -518,7 +523,7 @@ async def upsert_user(message: Message, ref_partner_id: Optional[int] = None) ->
     name = full_name(message)
     role = "admin" if is_admin(user_id) else "warehouse" if user_id in WAREHOUSE_IDS else "client"
     code = partner_code(user_id)
-    async with await get_db() as db:
+    async with get_db() as db:
         existing = await db_fetchone(db, 
             "SELECT telegram_id, ref_partner_id, role FROM users WHERE telegram_id=?",
             (user_id,),
@@ -558,17 +563,17 @@ async def upsert_user(message: Message, ref_partner_id: Optional[int] = None) ->
 
 
 async def get_user(user_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchone(db, "SELECT * FROM users WHERE telegram_id=?", (user_id,))
 
 
 async def get_order_by_code(code: str) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchone(db, "SELECT * FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
 
 
 async def get_order(order_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
 
 
@@ -585,7 +590,7 @@ async def create_order(
     phone: str,
     partner_id: Optional[int] = None,
 ) -> aiosqlite.Row:
-    async with await get_db() as db:
+    async with get_db() as db:
         cur = await db.execute(
             """
             INSERT INTO orders (
@@ -627,7 +632,7 @@ async def update_order_status(
     created_by: int,
     comment: str = "",
 ) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE orders SET status=?, updated_at=? WHERE id=?",
             (status, now_iso(), order_id),
@@ -642,7 +647,7 @@ async def update_order_status(
 
 async def set_order_price(code: str, price: float, cost: float) -> Optional[aiosqlite.Row]:
     margin = price - cost
-    async with await get_db() as db:
+    async with get_db() as db:
         existing = await db_fetchone(db, "SELECT paid_amount FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
         if not existing:
             return None
@@ -657,7 +662,7 @@ async def set_order_price(code: str, price: float, cost: float) -> Optional[aios
 
 
 async def set_order_weight(code: str, weight: float, actor_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         row = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
         if not row:
             return None
@@ -672,7 +677,7 @@ async def set_order_weight(code: str, weight: float, actor_id: int) -> Optional[
 
 async def get_rate_from_db(from_country: str) -> float:
     key = normalize(from_country)
-    async with await get_db() as db:
+    async with get_db() as db:
         row = await db_fetchone(db, "SELECT rate FROM tariffs WHERE country_key=?", (key,))
     if row:
         return float(row["rate"])
@@ -689,7 +694,7 @@ async def estimate_delivery_price_db(from_country: str, weight: float, volume: f
 
 async def set_tariff(country_name: str, rate: float) -> None:
     key = normalize(country_name)
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             """
             INSERT INTO tariffs (country_key, country_name, rate, created_at, updated_at)
@@ -702,12 +707,12 @@ async def set_tariff(country_name: str, rate: float) -> None:
 
 
 async def list_tariffs() -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(db, "SELECT * FROM tariffs ORDER BY country_name")
 
 
 async def get_status_history(order_id: int) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM status_history WHERE order_id=? ORDER BY id ASC",
@@ -716,7 +721,7 @@ async def get_status_history(order_id: int) -> list[aiosqlite.Row]:
 
 
 async def add_cargo_photo(order_id: int, file_id: str, comment: str, created_by: int) -> None:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT INTO cargo_photos (order_id, file_id, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
             (order_id, file_id, comment, created_by, now_iso()),
@@ -725,7 +730,7 @@ async def add_cargo_photo(order_id: int, file_id: str, comment: str, created_by:
 
 
 async def list_cargo_photos(order_id: int) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM cargo_photos WHERE order_id=? ORDER BY id DESC LIMIT 10",
@@ -734,7 +739,7 @@ async def list_cargo_photos(order_id: int) -> list[aiosqlite.Row]:
 
 
 async def add_payment(code: str, amount: float, comment: str, created_by: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         order = await db_fetchone(db, "SELECT * FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
         if not order:
             return None
@@ -754,7 +759,7 @@ async def add_payment(code: str, amount: float, comment: str, created_by: int) -
 
 
 async def list_debts(limit: int = 30) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             """
@@ -768,7 +773,7 @@ async def list_debts(limit: int = 30) -> list[aiosqlite.Row]:
 
 
 async def assign_courier(code: str, courier_id: int, address: str, actor_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         row = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
         if not row:
             return None
@@ -785,7 +790,7 @@ async def assign_courier(code: str, courier_id: int, address: str, actor_id: int
 
 
 async def courier_orders(courier_id: int) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM orders WHERE courier_id=? AND status!='доставлен' ORDER BY updated_at DESC LIMIT 30",
@@ -807,12 +812,12 @@ async def list_orders(limit: int = 10, status: Optional[str] = None, user_id: Op
         query += " WHERE " + " AND ".join(conditions)
     query += " ORDER BY id DESC LIMIT ?"
     params.append(limit)
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(db, query, tuple(params))
 
 
 async def orders_on_warehouse() -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(db, 
             """
             SELECT * FROM orders
@@ -825,7 +830,7 @@ async def orders_on_warehouse() -> list[aiosqlite.Row]:
 async def create_complaint(user_id: int, code: str, text: str, urgency: str) -> aiosqlite.Row:
     order = await get_order_by_code(code) if code else None
     order_id = order["id"] if order else None
-    async with await get_db() as db:
+    async with get_db() as db:
         cur = await db.execute(
             """
             INSERT INTO complaints (user_id, order_id, tracking_code, text, urgency, status, created_at, updated_at)
@@ -839,7 +844,7 @@ async def create_complaint(user_id: int, code: str, text: str, urgency: str) -> 
 
 
 async def list_open_complaints(limit: int = 10) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(db, 
             "SELECT * FROM complaints WHERE status='open' ORDER BY id DESC LIMIT ?",
             (limit,),
@@ -847,7 +852,7 @@ async def list_open_complaints(limit: int = 10) -> list[aiosqlite.Row]:
 
 
 async def close_complaint(complaint_id: int) -> None:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE complaints SET status='closed', updated_at=? WHERE id=?",
             (now_iso(), complaint_id),
@@ -856,7 +861,7 @@ async def close_complaint(complaint_id: int) -> None:
 
 
 async def reply_complaint(complaint_id: int, reply: str) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE complaints SET admin_reply=?, status='closed', updated_at=? WHERE id=?",
             (reply, now_iso(), complaint_id),
@@ -878,7 +883,7 @@ def support_topic_label(topic: str) -> str:
 
 
 async def create_support_ticket(user_id: int, code: str, topic: str, text: str) -> aiosqlite.Row:
-    async with await get_db() as db:
+    async with get_db() as db:
         cur = await db.execute(
             """
             INSERT INTO support_tickets (user_id, tracking_code, topic, status, priority, last_message, created_at, updated_at)
@@ -899,12 +904,12 @@ async def create_support_ticket(user_id: int, code: str, topic: str, text: str) 
 
 
 async def get_support_ticket(ticket_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchone(db, "SELECT * FROM support_tickets WHERE id=?", (ticket_id,))
 
 
 async def list_open_support_tickets(limit: int = 15) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM support_tickets WHERE status!='closed' ORDER BY updated_at DESC LIMIT ?",
@@ -913,7 +918,7 @@ async def list_open_support_tickets(limit: int = 15) -> list[aiosqlite.Row]:
 
 
 async def list_user_support_tickets(user_id: int, limit: int = 10) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM support_tickets WHERE user_id=? ORDER BY updated_at DESC LIMIT ?",
@@ -922,7 +927,7 @@ async def list_user_support_tickets(user_id: int, limit: int = 10) -> list[aiosq
 
 
 async def list_support_messages(ticket_id: int, limit: int = 10) -> list[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         return await db_fetchall(
             db,
             "SELECT * FROM support_messages WHERE ticket_id=? ORDER BY id DESC LIMIT ?",
@@ -935,7 +940,7 @@ async def add_support_message(ticket_id: int, sender_id: int, sender_role: str, 
     if not ticket:
         return None
     status = new_status or ("answered" if sender_role == "admin" else "open")
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             """
             INSERT INTO support_messages (ticket_id, sender_id, sender_role, text, created_at)
@@ -952,7 +957,7 @@ async def add_support_message(ticket_id: int, sender_id: int, sender_role: str, 
 
 
 async def close_support_ticket(ticket_id: int) -> Optional[aiosqlite.Row]:
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "UPDATE support_tickets SET status='closed', updated_at=?, closed_at=? WHERE id=?",
             (now_iso(), now_iso(), ticket_id),
@@ -974,7 +979,7 @@ def format_support_ticket(ticket: aiosqlite.Row) -> str:
 
 
 async def finance_report() -> dict:
-    async with await get_db() as db:
+    async with get_db() as db:
         totals = await db_fetchone(db, 
             """
             SELECT COUNT(*) AS total_orders,
@@ -1003,7 +1008,7 @@ async def finance_report() -> dict:
 
 
 async def partner_report(user_id: int) -> dict:
-    async with await get_db() as db:
+    async with get_db() as db:
         leads = await db_fetchone(db, 
             "SELECT COUNT(*) AS cnt FROM partner_leads WHERE partner_id=?",
             (user_id,),
@@ -1171,7 +1176,7 @@ async def export_orders_to_excel() -> Path:
         "customer_name", "phone", "courier_id", "delivery_address", "created_at", "updated_at", "description"
     ]
     ws.append(headers)
-    async with await get_db() as db:
+    async with get_db() as db:
         rows = await db_fetchall(db, "SELECT * FROM orders ORDER BY id DESC")
     for o in rows:
         ws.append([o[h] if h in o.keys() else "" for h in headers])
@@ -1563,7 +1568,7 @@ async def cmd_makepartner(message: Message):
         await message.answer("Формат: /makepartner 123456789")
         return
     user_id = int(parts[1])
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, partner_code, created_at, updated_at) VALUES (?, '', '', 'partner', ?, ?, ?)",
             (user_id, partner_code(user_id), now_iso(), now_iso()),
@@ -1583,7 +1588,7 @@ async def cmd_role(message: Message):
         return
     user_id = int(parts[1])
     role = parts[2]
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, partner_code, created_at, updated_at) VALUES (?, '', '', ?, ?, ?, ?)",
             (user_id, role, partner_code(user_id), now_iso(), now_iso()),
@@ -1766,7 +1771,7 @@ async def cmd_assign_courier(message: Message, bot: Bot):
     if not order:
         await message.answer("Груз не найден.")
         return
-    async with await get_db() as db:
+    async with get_db() as db:
         await db.execute(
             "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, partner_code, created_at, updated_at) VALUES (?, '', '', 'courier', ?, ?, ?)",
             (courier_id, partner_code(courier_id), now_iso(), now_iso()),
@@ -2583,7 +2588,7 @@ async def courier_assign_finish(message: Message, state: FSMContext, bot: Bot):
     if not order:
         await message.answer("Груз не найден.", reply_markup=admin_keyboard())
         return
-    async with await get_db() as db:
+    async with get_db() as db:
         cid = int(data["courier_id"])
         await db.execute(
             "INSERT OR IGNORE INTO users (telegram_id, username, full_name, role, partner_code, created_at, updated_at) VALUES (?, '', '', 'courier', ?, ?, ?)",
@@ -2817,7 +2822,7 @@ async def broadcast_finish(message: Message, state: FSMContext, bot: Bot):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     text = message.text or ""
-    async with await get_db() as db:
+    async with get_db() as db:
         users = await db_fetchall(db, "SELECT telegram_id FROM users WHERE role IN ('client', 'partner')")
     sent = 0
     failed = 0
