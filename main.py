@@ -282,20 +282,20 @@ def client_keyboard() -> ReplyKeyboardMarkup:
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
+    # Важные кнопки держим в первых строках: в Telegram Desktop нижние строки
+    # reply-клавиатуры иногда скрываются, если окно маленькое.
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📥 Новые заявки"), KeyboardButton(text="📦 Все грузы")],
-            [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="🔁 Изменить статус")],
-            [KeyboardButton(text="💰 Финансы"), KeyboardButton(text="💸 Долги/оплаты")],
-            [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🛠️ Техподдержка")],
-            [KeyboardButton(text="🚚 Курьеры")],
+            [KeyboardButton(text="🤖 Автостатусы"), KeyboardButton(text="🔁 Изменить статус")],
+            [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="💸 Долги/оплаты")],
+            [KeyboardButton(text="💰 Финансы"), KeyboardButton(text="🛠️ Техподдержка")],
+            [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🚚 Курьеры")],
             [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
-            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="🤖 Автостатусы")],
-            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="👥 Роли")],
-            [KeyboardButton(text="🤝 Партнёры")],
-            [KeyboardButton(text="📊 Отчёт за день")],
-            [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🏭 Меню склада")],
-            [KeyboardButton(text="👤 Клиентское меню")],
+            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="📄 PDF квитанция")],
+            [KeyboardButton(text="👥 Роли"), KeyboardButton(text="🤝 Партнёры")],
+            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="🏭 Меню склада"), KeyboardButton(text="👤 Клиентское меню")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Админ-панель: выберите действие",
@@ -349,8 +349,9 @@ def admin_menu_text() -> str:
         f"<b>👑 Админ-меню {safe(COMPANY_NAME)}</b>\n\n"
         "<b>Работаем только через Telegram:</b>\n"
         "📥 заявки и грузы — обработка клиентов\n"
+        "🤖 автостатусы — бот сам ведёт груз по маршруту и уведомляет клиента\n"
         "🔎 поиск груза — быстро найти заказ по номеру\n"
-        "🔁 статусы — смена этапов и уведомления клиенту\n"
+        "🔁 статусы — ручная смена этапов, если нужно поправить маршрут\n"
         "💰 финансы — цена, оплаты, долги, маржа\n"
         "💬 жалобы — ответы клиентам\n"
         "🛠️ техподдержка — тикеты, ответы и закрытие обращений\n"
@@ -405,6 +406,32 @@ def auto_status_keyboard(order_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔁 Изменить статус вручную", callback_data=f"open_status:{order_id}")],
         ]
     )
+
+
+def auto_status_panel_keyboard(orders: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
+    """Главная панель автостатусов без команд.
+
+    Админ не должен писать /autostatus или /autoroute. Он нажимает кнопку,
+    а бот сам включает автостатусы и сам выбирает маршрут по направлению груза.
+    """
+    rows = [
+        [InlineKeyboardButton(text="✅ Включить всем активным грузам", callback_data="auto_enable_all")],
+        [InlineKeyboardButton(text="📋 Грузы без автостатусов", callback_data="auto_show_disabled")],
+    ]
+    for order in orders[:10]:
+        enabled = bool(int(order["auto_status_enabled"] or 0))
+        marker = "✅" if enabled else "🤖"
+        code = order["tracking_code"]
+        from_country = order["from_country"] or "?"
+        to_city = order["to_city"] or "?"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{marker} {code} · {from_country} → {to_city}",
+                callback_data=f"open_auto:{order['id']}",
+            )
+        ])
+    rows.append([InlineKeyboardButton(text="↩️ Назад в админ-меню", callback_data="admin_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def complaint_actions_keyboard(complaint_id: int) -> InlineKeyboardMarkup:
@@ -753,6 +780,21 @@ async def enable_auto_status_for_active_orders(actor_id: int = 0, limit: int = 5
         if updated:
             count += 1
     return count
+
+
+async def list_orders_without_auto_status(limit: int = 10) -> list[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchall(
+            db,
+            """
+            SELECT * FROM orders
+            WHERE COALESCE(auto_status_enabled, 0)=0
+              AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
 
 
 async def disable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
@@ -1697,10 +1739,8 @@ async def cmd_help_admin(message: Message):
         "/tariffs — список тарифов\n"
         "/receipt CG... — PDF-квитанция\n"
         "/assigncourier CG... 123456789 адрес — назначить курьера\n"
-        "/autostatus CG... on/off — включить или выключить автостатусы для груза\n"
-        "/autostatus_all on — включить автостатусы для всех активных грузов\n"
-        "/autoroute CG... china_cis — сменить шаблон маршрута вручную\n"
-        "/routes — список шаблонов автостатусов\n"
+        "🤖 Автостатусы — включить по кнопке без команд\n"
+        "📦 Все грузы → карточка груза → 🤖 Включить автостатусы\n"
     )
 
 
@@ -1744,7 +1784,7 @@ async def cmd_routes(message: Message):
     for key, route in AUTO_STATUS_ROUTES.items():
         steps = ", ".join(f"день {d}: {s}" for d, s, _ in route["stages"][:4])
         lines.append(f"<code>{safe(key)}</code> — {safe(route['name'])}\n{safe(steps)} ...")
-    lines.append("\nТеперь можно проще: в админке нажмите <b>🤖 Автостатусы</b>, введите номер груза, и бот сам выберет маршрут.\n\nКоманды для ручной настройки:\n<code>/autostatus CG... on</code> — включить\n<code>/autostatus CG... off</code> — выключить\n<code>/autoroute CG... china_cis</code> — выбрать маршрут вручную")
+    lines.append("\nТеперь всё работает без команд: откройте <b>/admin</b>, нажмите <b>🤖 Автостатусы</b> и выберите действие кнопкой. Бот сам определит маршрут по направлению груза.")
     await message.answer("\n\n".join(lines), reply_markup=admin_keyboard())
 
 
@@ -1819,20 +1859,19 @@ async def admin_auto_status_menu(message: Message, state: FSMContext):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await state.clear()
-    orders = await list_orders(limit=5)
+    orders = await list_orders(limit=10)
     text = (
-        "<b>🤖 Бесплатные автостатусы</b>\n\n"
-        "Новые заявки уже могут получать автостатусы автоматически. Для старых грузов введите номер <code>CG...</code>, "
-        "и бот сам определит маршрут.\n\n"
-        "Чтобы включить автостатусы сразу для всех активных грузов, напишите: <b>ВСЕ</b>.\n\n"
-        "Последние грузы:\n"
+        "<b>🤖 Автостатусы без команд</b>\n\n"
+        "Админу ничего не нужно писать вручную. Нажмите кнопку ниже — бот сам включит автостатусы, "
+        "сам определит маршрут по направлению груза и будет менять этапы по расписанию.\n\n"
+        "<b>Как работает:</b>\n"
+        "1) клиент оставляет заявку;\n"
+        "2) бот выбирает маршрут: Китай/Турция/ОАЭ/СНГ;\n"
+        "3) статус меняется автоматически;\n"
+        "4) клиент получает уведомления.\n\n"
+        "Выберите действие:"
     )
-    if orders:
-        text += "\n".join(format_short_order(o) for o in orders)
-    else:
-        text += "Грузов пока нет."
-    await state.set_state(AutoStatusForm.code)
-    await message.answer(text + "\n\nВведите номер груза CG...", reply_markup=admin_keyboard())
+    await message.answer(text, reply_markup=auto_status_panel_keyboard(orders))
 
 
 @router.message(AutoStatusForm.code)
@@ -1852,7 +1891,7 @@ async def auto_status_code(message: Message, state: FSMContext):
     code = parse_tracking_code(raw) or raw.upper()
     order = await get_order_by_code(code)
     if not order:
-        await message.answer("Груз не найден. Введите номер ещё раз, <b>ВСЕ</b> для всех активных или /admin для отмены.")
+        await message.answer("Груз не найден. Нажмите кнопку «🤖 Автостатусы» ещё раз или введите другой номер CG...")
         return
     updated = await enable_auto_status_for_order(order["id"], message.from_user.id)
     await state.clear()
@@ -3348,6 +3387,51 @@ async def warehouse_orders(message: Message):
 # =========================
 # CALLBACKS
 # =========================
+@router.callback_query(F.data == "admin_back")
+async def cb_admin_back(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await call.message.answer(admin_menu_text(), reply_markup=admin_keyboard())
+    await call.answer()
+
+
+@router.callback_query(F.data == "auto_enable_all")
+async def cb_auto_enable_all(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    count = await enable_auto_status_for_active_orders(call.from_user.id)
+    orders = await list_orders(limit=10)
+    await call.message.answer(
+        f"✅ Автостатусы включены для активных грузов: <b>{count}</b>.\n\n"
+        "Бот сам выбрал маршруты по направлениям и будет менять статусы по расписанию. "
+        "Клиенты получат уведомления автоматически.",
+        reply_markup=auto_status_panel_keyboard(orders),
+    )
+    await call.answer("Готово")
+
+
+@router.callback_query(F.data == "auto_show_disabled")
+async def cb_auto_show_disabled(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    orders = await list_orders_without_auto_status(limit=10)
+    if not orders:
+        await call.message.answer(
+            "✅ У всех активных грузов уже включены автостатусы.",
+            reply_markup=auto_status_panel_keyboard(await list_orders(limit=10)),
+        )
+    else:
+        await call.message.answer(
+            "<b>📋 Грузы без автостатусов</b>\n\n"
+            "Нажмите на нужный груз — дальше можно включить автостатусы одной кнопкой.",
+            reply_markup=auto_status_panel_keyboard(orders),
+        )
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("auto_enable:"))
 async def cb_auto_enable(call: CallbackQuery):
     if not call.from_user or not is_admin(call.from_user.id):
