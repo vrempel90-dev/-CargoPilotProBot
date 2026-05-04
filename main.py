@@ -7,7 +7,7 @@ import logging
 import os
 import re
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -60,6 +60,12 @@ RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
 PORT = int(os.getenv("PORT", "8080"))
 CURRENCY = os.getenv("CURRENCY", "$").strip() or "$"
 
+# Бесплатные автостатусы: бот сам меняет статус по срокам маршрута.
+# Не требует WhatsApp API, OpenAI, Gemini, Kaspi API или других платных сервисов.
+AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_STATUS_INTERVAL_SECONDS = int(os.getenv("AUTO_STATUS_INTERVAL_SECONDS", "300"))
+REGION_MODE = os.getenv("REGION_MODE", "CIS").strip() or "CIS"
+
 ADMIN_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_IDS", "").split(",")
@@ -77,6 +83,7 @@ COURIER_IDS = {
 }
 
 DEFAULT_RATES = {
+    # Основные направления карго
     "китай": 3.5,
     "china": 3.5,
     "турция": 4.2,
@@ -84,8 +91,27 @@ DEFAULT_RATES = {
     "дубай": 5.0,
     "uae": 5.0,
     "оаэ": 5.0,
+
+    # СНГ / локальная логистика
+    "казахстан": 2.0,
+    "kazakhstan": 2.0,
     "россия": 2.5,
     "russia": 2.5,
+    "узбекистан": 2.8,
+    "uzbekistan": 2.8,
+    "кыргызстан": 2.6,
+    "киргизия": 2.6,
+    "kyrgyzstan": 2.6,
+    "беларусь": 3.0,
+    "belarus": 3.0,
+    "армения": 3.2,
+    "armenia": 3.2,
+    "азербайджан": 3.2,
+    "azerbaijan": 3.2,
+    "таджикистан": 3.0,
+    "tajikistan": 3.0,
+    "молдова": 3.1,
+    "moldova": 3.1,
 }
 DEFAULT_COMMISSION_PERCENT = float(os.getenv("PARTNER_COMMISSION_PERCENT", "5"))
 
@@ -96,6 +122,7 @@ STATUSES = [
     "отправлен",
     "в пути",
     "на таможне",
+    "прибыл в страну",
     "прибыл в Казахстан",
     "прибыл в город",
     "готов к выдаче",
@@ -104,6 +131,63 @@ STATUSES = [
     "проблема",
     "отменён",
 ]
+
+# Бесплатные шаблоны автостатусов. День считается от даты создания заявки.
+# Это не интеграция с реальным складом/API, а автоматизация по типовым срокам маршрута.
+AUTO_STATUS_ROUTES = {
+    "china_cis": {
+        "name": "Китай → СНГ",
+        "stages": [
+            (0, "новая заявка", "Заявка создана"),
+            (1, "принят на склад", "Груз принят на склад отправителя"),
+            (3, "отправлен", "Груз отправлен по маршруту"),
+            (5, "в пути", "Груз находится в пути"),
+            (8, "на таможне", "Груз проходит таможенный этап"),
+            (12, "прибыл в страну", "Груз прибыл в страну назначения"),
+            (14, "прибыл в город", "Груз прибыл в город получателя"),
+            (15, "готов к выдаче", "Груз готов к выдаче"),
+        ],
+    },
+    "turkey_cis": {
+        "name": "Турция → СНГ",
+        "stages": [
+            (0, "новая заявка", "Заявка создана"),
+            (1, "принят на склад", "Груз принят на склад отправителя"),
+            (2, "отправлен", "Груз отправлен по маршруту"),
+            (4, "в пути", "Груз находится в пути"),
+            (7, "на таможне", "Груз проходит таможенный этап"),
+            (10, "прибыл в страну", "Груз прибыл в страну назначения"),
+            (12, "прибыл в город", "Груз прибыл в город получателя"),
+            (13, "готов к выдаче", "Груз готов к выдаче"),
+        ],
+    },
+    "uae_cis": {
+        "name": "Дубай/ОАЭ → СНГ",
+        "stages": [
+            (0, "новая заявка", "Заявка создана"),
+            (1, "принят на склад", "Груз принят на склад отправителя"),
+            (2, "отправлен", "Груз отправлен по маршруту"),
+            (4, "в пути", "Груз находится в пути"),
+            (6, "на таможне", "Груз проходит таможенный этап"),
+            (9, "прибыл в страну", "Груз прибыл в страну назначения"),
+            (11, "прибыл в город", "Груз прибыл в город получателя"),
+            (12, "готов к выдаче", "Груз готов к выдаче"),
+        ],
+    },
+    "cis_local": {
+        "name": "СНГ → СНГ",
+        "stages": [
+            (0, "новая заявка", "Заявка создана"),
+            (1, "принят на склад", "Груз принят на склад"),
+            (2, "отправлен", "Груз отправлен"),
+            (3, "в пути", "Груз находится в пути"),
+            (5, "прибыл в город", "Груз прибыл в город получателя"),
+            (6, "готов к выдаче", "Груз готов к выдаче"),
+        ],
+    },
+}
+
+TERMINAL_STATUSES = {"доставлен", "отменён", "проблема", "передан курьеру"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -202,8 +286,9 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🛠️ Техподдержка")],
             [KeyboardButton(text="🚚 Курьеры")],
             [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
-            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="👥 Роли")],
-            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="🤝 Партнёры")],
+            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="🤖 Автостатусы")],
+            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="👥 Роли")],
+            [KeyboardButton(text="🤝 Партнёры")],
             [KeyboardButton(text="📊 Отчёт за день")],
             [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="🏭 Меню склада")],
             [KeyboardButton(text="👤 Клиентское меню")],
@@ -500,13 +585,18 @@ async def init_db() -> None:
             "ALTER TABLE orders ADD COLUMN payment_status TEXT DEFAULT 'не оплачено'",
             "ALTER TABLE orders ADD COLUMN courier_id INTEGER",
             "ALTER TABLE orders ADD COLUMN delivery_address TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_status_enabled INTEGER DEFAULT 1",
+            "ALTER TABLE orders ADD COLUMN auto_status_route TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_status_started_at TEXT",
+            "ALTER TABLE orders ADD COLUMN auto_status_last_at TEXT",
         ]:
             try:
                 await db.execute(sql)
             except Exception:
                 pass
         for country, rate in DEFAULT_RATES.items():
-            if country in {'china', 'turkey', 'uae', 'russia'}:
+            # В тарифы показываем русские названия, английские ключи оставляем только для распознавания.
+            if re.search(r"[a-z]", country):
                 continue
             await db.execute(
                 "INSERT OR IGNORE INTO tariffs (country_key, country_name, rate, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
@@ -577,6 +667,57 @@ async def get_order(order_id: int) -> Optional[aiosqlite.Row]:
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
 
 
+def choose_auto_route(from_country: str, to_city: str = "") -> str:
+    text = normalize(f"{from_country} {to_city}")
+    if any(x in text for x in ["китай", "china", "guangzhou", "гуанчжоу", "иу", "yiwu", "1688", "taobao"]):
+        return "china_cis"
+    if any(x in text for x in ["турция", "turkey", "стамбул", "istanbul"]):
+        return "turkey_cis"
+    if any(x in text for x in ["дубай", "оаэ", "uae", "dubai", "emirates"]):
+        return "uae_cis"
+    return "cis_local"
+
+
+def auto_route_label(route_key: str) -> str:
+    route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
+    return route["name"]
+
+
+def parse_iso_datetime(value: str) -> datetime:
+    if not value:
+        return datetime.now(timezone.utc)
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return datetime.now(timezone.utc)
+
+
+def get_auto_target_status(order: aiosqlite.Row) -> Optional[tuple[str, str, str]]:
+    route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
+    route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
+    started_at = parse_iso_datetime(order["auto_status_started_at"] or order["created_at"] or now_iso())
+    days = (datetime.now(timezone.utc) - started_at).total_seconds() / 86400
+    target = None
+    target_index = -1
+    for idx, (day, status, comment) in enumerate(route["stages"]):
+        if days >= day:
+            target = (status, comment, route["name"])
+            target_index = idx
+    if not target:
+        return None
+    current_status = order["status"] or "новая заявка"
+    if current_status in TERMINAL_STATUSES:
+        return None
+    stage_statuses = [s for _, s, _ in route["stages"]]
+    current_index = stage_statuses.index(current_status) if current_status in stage_statuses else -1
+    if target_index <= current_index or target[0] == current_status:
+        return None
+    return target
+
+
 async def create_order(
     user_id: int,
     order_type: str,
@@ -617,7 +758,11 @@ async def create_order(
         )
         order_id = cur.lastrowid
         code = f"CG{datetime.now().strftime('%y%m%d')}{order_id:05d}"
-        await db.execute("UPDATE orders SET tracking_code=? WHERE id=?", (code, order_id))
+        route_key = choose_auto_route(from_country, to_city)
+        await db.execute(
+            "UPDATE orders SET tracking_code=?, auto_status_route=?, auto_status_enabled=1, auto_status_started_at=? WHERE id=?",
+            (code, route_key, now_iso(), order_id),
+        )
         await db.execute(
             "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
             (order_id, "новая заявка", "Заявка создана клиентом", user_id, now_iso()),
@@ -1078,6 +1223,7 @@ def format_order(order: aiosqlite.Row) -> str:
         f"Вес: {safe(order['weight'])} кг\n"
         f"Объём: {safe(order['volume'])} м³\n"
         f"Статус: <b>{safe(order['status'])}</b>\n"
+        f"Автостатусы: {'вкл' if int(order['auto_status_enabled'] or 0) else 'выкл'} | {safe(auto_route_label(order['auto_status_route'] or choose_auto_route(order['from_country'] or '', order['to_city'] or '')))}\n"
         f"Цена клиенту: {safe(order['price'])} {safe(CURRENCY)}\n"
         f"Оплачено: {safe(order['paid_amount'])} {safe(CURRENCY)} | {safe(order['payment_status'])}\n"
         f"Курьер: {safe(order['courier_id']) if order['courier_id'] else 'не назначен'}\n"
@@ -1426,6 +1572,9 @@ async def cmd_help_admin(message: Message):
         "/tariffs — список тарифов\n"
         "/receipt CG... — PDF-квитанция\n"
         "/assigncourier CG... 123456789 адрес — назначить курьера\n"
+        "/autostatus CG... on/off — включить или выключить автостатусы\n"
+        "/autoroute CG... china_cis — сменить шаблон маршрута\n"
+        "/routes — список шаблонов автостатусов\n"
     )
 
 
@@ -1459,6 +1608,68 @@ async def cmd_setstatus(message: Message, bot: Bot):
         updated["user_id"],
         f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}",
     )
+
+
+@router.message(Command("routes"))
+async def cmd_routes(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    lines = ["<b>🤖 Шаблоны автостатусов</b>"]
+    for key, route in AUTO_STATUS_ROUTES.items():
+        steps = ", ".join(f"день {d}: {s}" for d, s, _ in route["stages"][:4])
+        lines.append(f"<code>{safe(key)}</code> — {safe(route['name'])}\n{safe(steps)} ...")
+    lines.append("\nКоманды:\n<code>/autostatus CG... on</code> — включить\n<code>/autostatus CG... off</code> — выключить\n<code>/autoroute CG... china_cis</code> — выбрать маршрут")
+    await message.answer("\n\n".join(lines), reply_markup=admin_keyboard())
+
+
+@router.message(Command("autostatus"))
+async def cmd_autostatus(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or parts[2].lower() not in {"on", "off", "вкл", "выкл"}:
+        await message.answer("Формат: /autostatus CG26050300001 on или /autostatus CG26050300001 off")
+        return
+    code = parts[1].upper()
+    enabled = 1 if parts[2].lower() in {"on", "вкл"} else 0
+    async with get_db() as db:
+        row = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
+        if not row:
+            await message.answer("Груз не найден.")
+            return
+        await db.execute("UPDATE orders SET auto_status_enabled=?, updated_at=? WHERE id=?", (enabled, now_iso(), row["id"]))
+        await db.commit()
+    await message.answer(f"✅ Автостатусы для {safe(code)}: {'включены' if enabled else 'выключены'}")
+
+
+@router.message(Command("autoroute"))
+async def cmd_autoroute(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or parts[2] not in AUTO_STATUS_ROUTES:
+        await message.answer("Формат: /autoroute CG26050300001 china_cis\n\nСписок: /routes")
+        return
+    code = parts[1].upper()
+    route_key = parts[2]
+    async with get_db() as db:
+        row = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
+        if not row:
+            await message.answer("Груз не найден.")
+            return
+        await db.execute(
+            "UPDATE orders SET auto_status_route=?, auto_status_enabled=1, auto_status_started_at=?, updated_at=? WHERE id=?",
+            (route_key, now_iso(), now_iso(), row["id"]),
+        )
+        await db.commit()
+    await message.answer(f"✅ Маршрут автостатусов для {safe(code)}: {safe(auto_route_label(route_key))}")
+
+
+@router.message(F.text == "🤖 Автостатусы")
+async def admin_auto_status_menu(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await cmd_routes(message)
 
 
 @router.message(Command("setprice"))
@@ -3103,6 +3314,60 @@ async def free_ai_router(message: Message, state: FSMContext):
 
 
 # =========================
+# FREE AUTO STATUS ENGINE
+# =========================
+async def process_auto_statuses(bot: Bot) -> int:
+    if not AUTO_STATUS_ENABLED:
+        return 0
+    async with get_db() as db:
+        rows = await db_fetchall(
+            db,
+            """
+            SELECT * FROM orders
+            WHERE COALESCE(auto_status_enabled, 1)=1
+              AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
+            ORDER BY id ASC
+            LIMIT 100
+            """,
+        )
+    changed = 0
+    for order in rows:
+        try:
+            target = get_auto_target_status(order)
+            if not target:
+                continue
+            status, comment, route_name = target
+            updated = await update_order_status(order["id"], status, 0, f"Автостатус: {comment}. Маршрут: {route_name}")
+            if not updated:
+                continue
+            async with get_db() as db:
+                await db.execute("UPDATE orders SET auto_status_last_at=? WHERE id=?", (now_iso(), order["id"]))
+                await db.commit()
+            changed += 1
+            await notify_user(
+                bot,
+                updated["user_id"],
+                f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}",
+            )
+        except Exception as e:
+            logger.exception("Auto status failed for order %s: %s", order["id"], e)
+    return changed
+
+
+async def auto_status_loop(bot: Bot) -> None:
+    await asyncio.sleep(15)
+    logger.info("Auto status engine: enabled=%s interval=%s", AUTO_STATUS_ENABLED, AUTO_STATUS_INTERVAL_SECONDS)
+    while True:
+        try:
+            changed = await process_auto_statuses(bot)
+            if changed:
+                logger.info("Auto status engine changed %s orders", changed)
+        except Exception as e:
+            logger.exception("Auto status loop error: %s", e)
+        await asyncio.sleep(max(60, AUTO_STATUS_INTERVAL_SECONDS))
+
+
+# =========================
 # HEALTH SERVER
 # =========================
 async def health(_: web.Request) -> web.Response:
@@ -3128,6 +3393,7 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
     asyncio.create_task(start_health_server(bot))
+    asyncio.create_task(auto_status_loop(bot))
     logger.info("Starting polling. DB=%s", DB_PATH)
     await dp.start_polling(bot)
 
