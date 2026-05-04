@@ -267,7 +267,7 @@ def parse_tracking_code(text: str) -> Optional[str]:
 def client_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📦 Отправить груз"), KeyboardButton(text="🔎 Где мой груз?")],
+            [KeyboardButton(text="📦 Оформить доставку"), KeyboardButton(text="🔎 Где мой груз?")],
             [KeyboardButton(text="🧮 Рассчитать доставку"), KeyboardButton(text="🛒 Выкуп товара")],
             [KeyboardButton(text="🏢 Оптовая доставка"), KeyboardButton(text="⚠️ Жалоба / проблема")],
             [KeyboardButton(text="🛠️ Техподдержка")],
@@ -2244,10 +2244,12 @@ async def show_client_menu(message: Message, state: FSMContext):
 
 
 @router.message(F.text == "📦 Отправить груз")
+@router.message(F.text == "📦 Оформить доставку")
+@router.message(F.text == "📦 Оставить заявку")
 async def cargo_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(CargoForm.from_country)
-    await message.answer("Откуда груз? Например: Китай, Турция, Дубай, Россия")
+    await message.answer("Оформим заявку на доставку. Откуда груз? Например: Китай, Турция, Дубай, Россия")
 
 
 @router.message(CargoForm.from_country)
