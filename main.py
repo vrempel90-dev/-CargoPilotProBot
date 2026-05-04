@@ -64,6 +64,10 @@ CURRENCY = os.getenv("CURRENCY", "$").strip() or "$"
 # Не требует WhatsApp API, OpenAI, Gemini, Kaspi API или других платных сервисов.
 AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_STATUS_INTERVAL_SECONDS = int(os.getenv("AUTO_STATUS_INTERVAL_SECONDS", "300"))
+# days = реальная работа, minutes = демо-режим для быстрых показов клиенту. Оба режима бесплатные.
+AUTO_STATUS_TIME_UNIT = os.getenv("AUTO_STATUS_TIME_UNIT", "days").strip().lower()
+# Если true, новые заявки сразу получают бесплатный авто-маршрут без ручного включения.
+AUTO_STATUS_ON_NEW_ORDERS = os.getenv("AUTO_STATUS_ON_NEW_ORDERS", "true").strip().lower() in {"1", "true", "yes", "on"}
 REGION_MODE = os.getenv("REGION_MODE", "CIS").strip() or "CIS"
 
 ADMIN_IDS = {
@@ -385,9 +389,20 @@ def status_keyboard(order_id: int) -> InlineKeyboardMarkup:
 def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Включить автостатусы", callback_data=f"auto_enable:{order_id}")],
             [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="✅ Доставлен", callback_data=f"st:{order_id}:доставлен")],
             [InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"st:{order_id}:проблема")],
+        ]
+    )
+
+
+def auto_status_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Включить автостатусы", callback_data=f"auto_enable:{order_id}")],
+            [InlineKeyboardButton(text="⏸ Выключить автостатусы", callback_data=f"auto_disable:{order_id}")],
+            [InlineKeyboardButton(text="🔁 Изменить статус вручную", callback_data=f"open_status:{order_id}")],
         ]
     )
 
@@ -585,7 +600,7 @@ async def init_db() -> None:
             "ALTER TABLE orders ADD COLUMN payment_status TEXT DEFAULT 'не оплачено'",
             "ALTER TABLE orders ADD COLUMN courier_id INTEGER",
             "ALTER TABLE orders ADD COLUMN delivery_address TEXT",
-            "ALTER TABLE orders ADD COLUMN auto_status_enabled INTEGER DEFAULT 1",
+            "ALTER TABLE orders ADD COLUMN auto_status_enabled INTEGER DEFAULT 0",
             "ALTER TABLE orders ADD COLUMN auto_status_route TEXT",
             "ALTER TABLE orders ADD COLUMN auto_status_started_at TEXT",
             "ALTER TABLE orders ADD COLUMN auto_status_last_at TEXT",
@@ -683,6 +698,80 @@ def auto_route_label(route_key: str) -> str:
     return route["name"]
 
 
+async def enable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
+    """Включает бесплатные автостатусы одной кнопкой.
+
+    Маршрут выбирается автоматически по направлению груза, поэтому админу
+    не нужно вводить команды /autoroute и выбирать шаблон вручную.
+    """
+    order = await get_order(order_id)
+    if not order:
+        return None
+    route_key = choose_auto_route(order["from_country"] or "", order["to_city"] or "")
+    async with get_db() as db:
+        await db.execute(
+            """
+            UPDATE orders
+            SET auto_status_enabled=1,
+                auto_status_route=?,
+                auto_status_started_at=?,
+                auto_status_last_at=NULL,
+                updated_at=?
+            WHERE id=?
+            """,
+            (route_key, now_iso(), now_iso(), order_id),
+        )
+        await db.execute(
+            "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (order_id, order["status"] or "новая заявка", f"Автостатусы включены. Маршрут: {auto_route_label(route_key)}", actor_id, now_iso()),
+        )
+        await db.commit()
+    return await get_order(order_id)
+
+
+async def enable_auto_status_for_active_orders(actor_id: int = 0, limit: int = 500) -> int:
+    """Включает автостатусы сразу для всех активных грузов.
+
+    Это нужно для реальной карго-работы: админ не включает статусы каждому
+    клиенту отдельно. Бот сам подбирает маршрут по направлению каждого груза.
+    """
+    async with get_db() as db:
+        rows = await db_fetchall(
+            db,
+            """
+            SELECT id FROM orders
+            WHERE COALESCE(auto_status_enabled, 0)=0
+              AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+    count = 0
+    for row in rows:
+        updated = await enable_auto_status_for_order(row["id"], actor_id)
+        if updated:
+            count += 1
+    return count
+
+
+async def disable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
+    order = await get_order(order_id)
+    if not order:
+        return None
+    async with get_db() as db:
+        await db.execute(
+            "UPDATE orders SET auto_status_enabled=0, updated_at=? WHERE id=?",
+            (now_iso(), order_id),
+        )
+        await db.execute(
+            "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (order_id, order["status"] or "новая заявка", "Автостатусы выключены", actor_id, now_iso()),
+        )
+        await db.commit()
+    return await get_order(order_id)
+
+
 def parse_iso_datetime(value: str) -> datetime:
     if not value:
         return datetime.now(timezone.utc)
@@ -699,11 +788,14 @@ def get_auto_target_status(order: aiosqlite.Row) -> Optional[tuple[str, str, str
     route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
     route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
     started_at = parse_iso_datetime(order["auto_status_started_at"] or order["created_at"] or now_iso())
-    days = (datetime.now(timezone.utc) - started_at).total_seconds() / 86400
+    elapsed_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+    # В реальной работе этапы считаются днями. Для демонстрации можно поставить
+    # AUTO_STATUS_TIME_UNIT=minutes, тогда те же значения станут минутами.
+    elapsed_units = elapsed_seconds / 60 if AUTO_STATUS_TIME_UNIT == "minutes" else elapsed_seconds / 86400
     target = None
     target_index = -1
     for idx, (day, status, comment) in enumerate(route["stages"]):
-        if days >= day:
+        if elapsed_units >= day:
             target = (status, comment, route["name"])
             target_index = idx
     if not target:
@@ -759,14 +851,22 @@ async def create_order(
         order_id = cur.lastrowid
         code = f"CG{datetime.now().strftime('%y%m%d')}{order_id:05d}"
         route_key = choose_auto_route(from_country, to_city)
+        created_at = now_iso()
+        auto_enabled = 1 if AUTO_STATUS_ON_NEW_ORDERS else 0
+        auto_started_at = created_at if AUTO_STATUS_ON_NEW_ORDERS else None
         await db.execute(
-            "UPDATE orders SET tracking_code=?, auto_status_route=?, auto_status_enabled=1, auto_status_started_at=? WHERE id=?",
-            (code, route_key, now_iso(), order_id),
+            "UPDATE orders SET tracking_code=?, auto_status_route=?, auto_status_enabled=?, auto_status_started_at=? WHERE id=?",
+            (code, route_key, auto_enabled, auto_started_at, order_id),
         )
         await db.execute(
             "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
             (order_id, "новая заявка", "Заявка создана клиентом", user_id, now_iso()),
         )
+        if AUTO_STATUS_ON_NEW_ORDERS:
+            await db.execute(
+                "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+                (order_id, "новая заявка", f"Автостатусы включены автоматически. Маршрут: {auto_route_label(route_key)}", 0, now_iso()),
+            )
         await db.commit()
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
 
@@ -1446,6 +1546,10 @@ class StatusForm(StatesGroup):
     comment = State()
 
 
+class AutoStatusForm(StatesGroup):
+    code = State()
+
+
 class WeightForm(StatesGroup):
     code = State()
     weight = State()
@@ -1547,6 +1651,27 @@ async def cmd_warehouse(message: Message, state: FSMContext):
     await message.answer(warehouse_menu_text(), reply_markup=warehouse_keyboard())
 
 
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    if message.from_user and is_admin(message.from_user.id):
+        await message.answer(
+            "<b>Помощь CargoPilot Pro</b>\n\n"
+            "/start — клиентское меню\n"
+            "/admin — админ-меню\n"
+            "/warehouse — меню склада\n"
+            "/courier — меню курьера\n"
+            "/routes — маршруты автостатусов\n"
+            "/support — открытые обращения\n"
+            "/help_admin — все команды админа"
+        )
+    else:
+        await message.answer(
+            "<b>Помощь</b>\n\n"
+            "Нажмите /start, чтобы открыть меню.\n"
+            "Вы можете оформить доставку, рассчитать стоимость, проверить статус груза, создать обращение в техподдержку или посмотреть свои заказы."
+        )
+
+
 @router.message(Command("help_admin"))
 async def cmd_help_admin(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
@@ -1572,8 +1697,9 @@ async def cmd_help_admin(message: Message):
         "/tariffs — список тарифов\n"
         "/receipt CG... — PDF-квитанция\n"
         "/assigncourier CG... 123456789 адрес — назначить курьера\n"
-        "/autostatus CG... on/off — включить или выключить автостатусы\n"
-        "/autoroute CG... china_cis — сменить шаблон маршрута\n"
+        "/autostatus CG... on/off — включить или выключить автостатусы для груза\n"
+        "/autostatus_all on — включить автостатусы для всех активных грузов\n"
+        "/autoroute CG... china_cis — сменить шаблон маршрута вручную\n"
         "/routes — список шаблонов автостатусов\n"
     )
 
@@ -1618,7 +1744,7 @@ async def cmd_routes(message: Message):
     for key, route in AUTO_STATUS_ROUTES.items():
         steps = ", ".join(f"день {d}: {s}" for d, s, _ in route["stages"][:4])
         lines.append(f"<code>{safe(key)}</code> — {safe(route['name'])}\n{safe(steps)} ...")
-    lines.append("\nКоманды:\n<code>/autostatus CG... on</code> — включить\n<code>/autostatus CG... off</code> — выключить\n<code>/autoroute CG... china_cis</code> — выбрать маршрут")
+    lines.append("\nТеперь можно проще: в админке нажмите <b>🤖 Автостатусы</b>, введите номер груза, и бот сам выберет маршрут.\n\nКоманды для ручной настройки:\n<code>/autostatus CG... on</code> — включить\n<code>/autostatus CG... off</code> — выключить\n<code>/autoroute CG... china_cis</code> — выбрать маршрут вручную")
     await message.answer("\n\n".join(lines), reply_markup=admin_keyboard())
 
 
@@ -1631,15 +1757,38 @@ async def cmd_autostatus(message: Message):
         await message.answer("Формат: /autostatus CG26050300001 on или /autostatus CG26050300001 off")
         return
     code = parts[1].upper()
-    enabled = 1 if parts[2].lower() in {"on", "вкл"} else 0
-    async with get_db() as db:
-        row = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
-        if not row:
-            await message.answer("Груз не найден.")
-            return
-        await db.execute("UPDATE orders SET auto_status_enabled=?, updated_at=? WHERE id=?", (enabled, now_iso(), row["id"]))
-        await db.commit()
-    await message.answer(f"✅ Автостатусы для {safe(code)}: {'включены' if enabled else 'выключены'}")
+    order = await get_order_by_code(code)
+    if not order:
+        await message.answer("Груз не найден.")
+        return
+    if parts[2].lower() in {"on", "вкл"}:
+        updated = await enable_auto_status_for_order(order["id"], message.from_user.id)
+        route_name = auto_route_label(updated["auto_status_route"] or choose_auto_route(updated["from_country"] or "", updated["to_city"] or ""))
+        await message.answer(
+            f"✅ Автостатусы включены для <b>{safe(code)}</b>.\n"
+            f"Маршрут выбран автоматически: <b>{safe(route_name)}</b>.\n\n"
+            "Теперь бот будет сам менять статусы по расписанию маршрута.",
+            reply_markup=admin_keyboard(),
+        )
+    else:
+        await disable_auto_status_for_order(order["id"], message.from_user.id)
+        await message.answer(f"⏸ Автостатусы для <b>{safe(code)}</b> выключены.", reply_markup=admin_keyboard())
+
+
+@router.message(Command("autostatus_all"))
+async def cmd_autostatus_all(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or parts[1].lower() not in {"on", "вкл"}:
+        await message.answer("Формат: /autostatus_all on")
+        return
+    count = await enable_auto_status_for_active_orders(message.from_user.id)
+    await message.answer(
+        f"✅ Автостатусы включены для активных грузов: {count}.\n\n"
+        "Новые заявки также получают автостатусы автоматически, если AUTO_STATUS_ON_NEW_ORDERS=true.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @router.message(Command("autoroute"))
@@ -1666,10 +1815,55 @@ async def cmd_autoroute(message: Message):
 
 
 @router.message(F.text == "🤖 Автостатусы")
-async def admin_auto_status_menu(message: Message):
+async def admin_auto_status_menu(message: Message, state: FSMContext):
     if not message.from_user or not is_admin(message.from_user.id):
         return
-    await cmd_routes(message)
+    await state.clear()
+    orders = await list_orders(limit=5)
+    text = (
+        "<b>🤖 Бесплатные автостатусы</b>\n\n"
+        "Новые заявки уже могут получать автостатусы автоматически. Для старых грузов введите номер <code>CG...</code>, "
+        "и бот сам определит маршрут.\n\n"
+        "Чтобы включить автостатусы сразу для всех активных грузов, напишите: <b>ВСЕ</b>.\n\n"
+        "Последние грузы:\n"
+    )
+    if orders:
+        text += "\n".join(format_short_order(o) for o in orders)
+    else:
+        text += "Грузов пока нет."
+    await state.set_state(AutoStatusForm.code)
+    await message.answer(text + "\n\nВведите номер груза CG...", reply_markup=admin_keyboard())
+
+
+@router.message(AutoStatusForm.code)
+async def auto_status_code(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if normalize(raw) in {"все", "all", "всё"}:
+        count = await enable_auto_status_for_active_orders(message.from_user.id)
+        await state.clear()
+        await message.answer(
+            f"✅ Автостатусы включены для активных грузов: {count}.\n\n"
+            "Бот сам выбрал маршруты по направлениям и будет уведомлять клиентов при смене статусов.",
+            reply_markup=admin_keyboard(),
+        )
+        return
+    code = parse_tracking_code(raw) or raw.upper()
+    order = await get_order_by_code(code)
+    if not order:
+        await message.answer("Груз не найден. Введите номер ещё раз, <b>ВСЕ</b> для всех активных или /admin для отмены.")
+        return
+    updated = await enable_auto_status_for_order(order["id"], message.from_user.id)
+    await state.clear()
+    route_name = auto_route_label(updated["auto_status_route"] or choose_auto_route(updated["from_country"] or "", updated["to_city"] or ""))
+    await message.answer(
+        f"✅ Автостатусы включены для <b>{safe(updated['tracking_code'])}</b>.\n"
+        f"Маршрут выбран автоматически: <b>{safe(route_name)}</b>.\n\n"
+        "Бот сам будет менять статусы по расписанию маршрута и уведомлять клиента.\n"
+        "Если груз задержится, статус можно изменить вручную в любой момент.",
+        reply_markup=admin_keyboard(),
+    )
 
 
 @router.message(Command("setprice"))
@@ -3154,6 +3348,61 @@ async def warehouse_orders(message: Message):
 # =========================
 # CALLBACKS
 # =========================
+@router.callback_query(F.data.startswith("auto_enable:"))
+async def cb_auto_enable(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    updated = await enable_auto_status_for_order(order_id, call.from_user.id)
+    if not updated:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    route_name = auto_route_label(updated["auto_status_route"] or choose_auto_route(updated["from_country"] or "", updated["to_city"] or ""))
+    await call.message.answer(
+        f"✅ Автостатусы включены для <b>{safe(updated['tracking_code'])}</b>.\n"
+        f"Маршрут выбран автоматически: <b>{safe(route_name)}</b>.\n\n"
+        "Бот сам будет менять статусы по расписанию маршрута и уведомлять клиента.",
+        reply_markup=order_actions_keyboard(order_id),
+    )
+    await call.answer("Автостатусы включены")
+
+
+@router.callback_query(F.data.startswith("auto_disable:"))
+async def cb_auto_disable(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    updated = await disable_auto_status_for_order(order_id, call.from_user.id)
+    if not updated:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    await call.message.answer(f"⏸ Автостатусы для <b>{safe(updated['tracking_code'])}</b> выключены.")
+    await call.answer("Автостатусы выключены")
+
+
+@router.callback_query(F.data.startswith("open_auto:"))
+async def cb_open_auto_status(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
+    await call.message.answer(
+        f"<b>🤖 Автостатусы для {safe(order['tracking_code'])}</b>\n\n"
+        f"Сейчас: {'включены' if int(order['auto_status_enabled'] or 0) else 'выключены'}\n"
+        f"Маршрут: {safe(auto_route_label(route_key))}\n\n"
+        "Нажмите кнопку ниже, чтобы бот сам вёл этот груз по статусам.",
+        reply_markup=auto_status_keyboard(order_id),
+    )
+    await call.answer()
+
+
 @router.callback_query(F.data.startswith("open_status:"))
 async def cb_open_status(call: CallbackQuery):
     if not call.from_user or not (is_admin(call.from_user.id) or is_warehouse(call.from_user.id)):
@@ -3324,7 +3573,7 @@ async def process_auto_statuses(bot: Bot) -> int:
             db,
             """
             SELECT * FROM orders
-            WHERE COALESCE(auto_status_enabled, 1)=1
+            WHERE COALESCE(auto_status_enabled, 0)=1
               AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
             ORDER BY id ASC
             LIMIT 100
@@ -3356,7 +3605,7 @@ async def process_auto_statuses(bot: Bot) -> int:
 
 async def auto_status_loop(bot: Bot) -> None:
     await asyncio.sleep(15)
-    logger.info("Auto status engine: enabled=%s interval=%s", AUTO_STATUS_ENABLED, AUTO_STATUS_INTERVAL_SECONDS)
+    logger.info("Auto status engine: enabled=%s on_new=%s interval=%s unit=%s", AUTO_STATUS_ENABLED, AUTO_STATUS_ON_NEW_ORDERS, AUTO_STATUS_INTERVAL_SECONDS, AUTO_STATUS_TIME_UNIT)
     while True:
         try:
             changed = await process_auto_statuses(bot)
@@ -3364,7 +3613,8 @@ async def auto_status_loop(bot: Bot) -> None:
                 logger.info("Auto status engine changed %s orders", changed)
         except Exception as e:
             logger.exception("Auto status loop error: %s", e)
-        await asyncio.sleep(max(60, AUTO_STATUS_INTERVAL_SECONDS))
+        # Для реальной работы обычно 300 сек. Для демо можно поставить 10-30 сек.
+        await asyncio.sleep(max(10, AUTO_STATUS_INTERVAL_SECONDS))
 
 
 # =========================
