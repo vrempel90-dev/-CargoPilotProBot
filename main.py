@@ -193,6 +193,13 @@ AUTO_STATUS_ROUTES = {
 
 TERMINAL_STATUSES = {"доставлен", "отменён", "проблема", "передан курьеру"}
 
+SUPPORT_REPLY_TEMPLATES = {
+    "check": "Здравствуйте! Мы проверим информацию по вашему обращению и вернёмся с ответом.",
+    "route": "Здравствуйте! Ваш груз находится в пути. Как только статус изменится, бот автоматически отправит уведомление.",
+    "payment": "Здравствуйте! Пожалуйста, проверьте оплату по вашему грузу. Если уже оплатили — отправьте подтверждение менеджеру.",
+    "ready": "Здравствуйте! Ваш груз готов к выдаче. Можете связаться с менеджером для уточнения времени получения.",
+}
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -291,11 +298,13 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="💸 Долги/оплаты")],
             [KeyboardButton(text="💰 Финансы"), KeyboardButton(text="🛠️ Техподдержка")],
             [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🚚 Курьеры")],
+            [KeyboardButton(text="📦 Партии"), KeyboardButton(text="👥 Клиенты")],
             [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
-            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="📄 PDF квитанция")],
-            [KeyboardButton(text="👥 Роли"), KeyboardButton(text="🤝 Партнёры")],
-            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="🏭 Меню склада"), KeyboardButton(text="👤 Клиентское меню")],
+            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="⚙️ Статусы")],
+            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="📢 Рассылка")],
+            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="🤝 Партнёры")],
+            [KeyboardButton(text="👥 Роли"), KeyboardButton(text="🏭 Меню склада")],
+            [KeyboardButton(text="👤 Клиентское меню")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Админ-панель: выберите действие",
@@ -380,9 +389,9 @@ def courier_menu_text() -> str:
     )
 
 
-def status_keyboard(order_id: int) -> InlineKeyboardMarkup:
+def status_keyboard(order_id: int, statuses: Optional[list[str]] = None) -> InlineKeyboardMarkup:
     rows = []
-    for status in STATUSES:
+    for status in statuses or STATUSES:
         rows.append([InlineKeyboardButton(text=status, callback_data=f"st:{order_id}:{status}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -473,10 +482,72 @@ def support_ticket_actions_keyboard(ticket_id: int, include_client_reply: bool =
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="💬 Ответить", callback_data=f"support_reply:{ticket_id}")],
+            [InlineKeyboardButton(text="✅ Проверим", callback_data=f"support_tpl:{ticket_id}:check"), InlineKeyboardButton(text="🚚 В пути", callback_data=f"support_tpl:{ticket_id}:route")],
+            [InlineKeyboardButton(text="💰 Оплата", callback_data=f"support_tpl:{ticket_id}:payment"), InlineKeyboardButton(text="📦 Готов", callback_data=f"support_tpl:{ticket_id}:ready")],
             [InlineKeyboardButton(text="✅ Закрыть", callback_data=f"support_close:{ticket_id}")],
         ]
     )
 
+
+
+
+def batch_panel_keyboard(batches: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Создать партию", callback_data="batch_create")],
+        [InlineKeyboardButton(text="➕ Добавить грузы в партию", callback_data="batch_add_orders")],
+        [InlineKeyboardButton(text="🔁 Сменить статус партии", callback_data="batch_change_status")],
+        [InlineKeyboardButton(text="📋 Активные партии", callback_data="batch_list")],
+    ]
+    for b in batches[:8]:
+        rows.append([InlineKeyboardButton(text=f"📦 #{b['id']} · {b['name']} · {b['status']}", callback_data=f"batch_open:{b['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def batch_actions_keyboard(batch_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить грузы", callback_data=f"batch_add_to:{batch_id}")],
+        [InlineKeyboardButton(text="🔁 Сменить статус партии", callback_data=f"batch_status_for:{batch_id}")],
+        [InlineKeyboardButton(text="📋 Грузы в партии", callback_data=f"batch_orders:{batch_id}")],
+    ])
+
+
+def batch_status_keyboard(batch_id: int, statuses: list[str]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=status, callback_data=f"batch_set_status:{batch_id}:{status}")] for status in statuses
+    ])
+
+
+def tariffs_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить/изменить тариф", callback_data="tariff_add")],
+        [InlineKeyboardButton(text="📋 Показать тарифы", callback_data="tariff_list")],
+    ])
+
+
+def statuses_panel_keyboard(custom_statuses: list[aiosqlite.Row]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Добавить статус", callback_data="status_add")],
+        [InlineKeyboardButton(text="📋 Показать все статусы", callback_data="status_list")],
+    ]
+    for st in custom_statuses[:10]:
+        rows.append([InlineKeyboardButton(text=f"🗑 Удалить: {st['name']}", callback_data=f"status_delete:{st['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def debts_keyboard(rows: list[aiosqlite.Row]) -> InlineKeyboardMarkup | None:
+    buttons = []
+    for o in rows[:10]:
+        buttons.append([InlineKeyboardButton(text=f"📩 Напомнить {o['tracking_code']}", callback_data=f"pay_remind:{o['id']}")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+
+def broadcast_audience_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Всем клиентам", callback_data="broadcast_audience:all")],
+        [InlineKeyboardButton(text="📦 Клиентам с активными грузами", callback_data="broadcast_audience:active")],
+        [InlineKeyboardButton(text="💸 Только должникам", callback_data="broadcast_audience:debtors")],
+        [InlineKeyboardButton(text="🤝 Партнёрам", callback_data="broadcast_audience:partners")],
+    ])
 
 @asynccontextmanager
 async def get_db():
@@ -618,6 +689,30 @@ async def init_db() -> None:
                 amount REAL,
                 comment TEXT,
                 created_by INTEGER,
+                created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                route_key TEXT,
+                status TEXT DEFAULT 'новая заявка',
+                created_by INTEGER,
+                created_at TEXT,
+                updated_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS batch_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id INTEGER,
+                order_id INTEGER,
+                created_at TEXT,
+                UNIQUE(batch_id, order_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS custom_statuses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT UNIQUE,
                 created_at TEXT
             );
             """
@@ -796,6 +891,162 @@ async def list_orders_without_auto_status(limit: int = 10) -> list[aiosqlite.Row
             (limit,),
         )
 
+
+
+async def get_custom_statuses() -> list[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchall(db, "SELECT * FROM custom_statuses ORDER BY id ASC")
+
+
+async def get_all_statuses() -> list[str]:
+    rows = await get_custom_statuses()
+    statuses = list(STATUSES)
+    for row in rows:
+        name = (row["name"] or "").strip()
+        if name and name not in statuses:
+            statuses.append(name)
+    return statuses
+
+
+async def add_custom_status(name: str) -> bool:
+    name = normalize(name)
+    if not name:
+        return False
+    async with get_db() as db:
+        await db.execute("INSERT OR IGNORE INTO custom_statuses (name, created_at) VALUES (?, ?)", (name, now_iso()))
+        await db.commit()
+    return True
+
+
+async def delete_custom_status(status_id: int) -> None:
+    async with get_db() as db:
+        await db.execute("DELETE FROM custom_statuses WHERE id=?", (status_id,))
+        await db.commit()
+
+
+async def create_batch(name: str, route_key: str, created_by: int) -> aiosqlite.Row:
+    route_key = route_key if route_key in AUTO_STATUS_ROUTES else "cis_local"
+    async with get_db() as db:
+        cur = await db.execute(
+            "INSERT INTO batches (name, route_key, status, created_by, created_at, updated_at) VALUES (?, ?, 'новая заявка', ?, ?, ?)",
+            (name.strip(), route_key, created_by, now_iso(), now_iso()),
+        )
+        batch_id = cur.lastrowid
+        await db.commit()
+    return await get_batch(batch_id)
+
+
+async def get_batch(batch_id: int) -> Optional[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchone(db, "SELECT * FROM batches WHERE id=?", (batch_id,))
+
+
+async def list_batches(limit: int = 10) -> list[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchall(db, "SELECT * FROM batches ORDER BY id DESC LIMIT ?", (limit,))
+
+
+async def add_orders_to_batch(batch_id: int, codes_text: str) -> tuple[int, int]:
+    codes = re.findall(r"CG\d{6}\d{4,}", (codes_text or "").upper())
+    if not codes:
+        codes = [x.strip().upper() for x in re.split(r"[,\n\s]+", codes_text or "") if x.strip().upper().startswith("CG")]
+    ok = 0
+    fail = 0
+    async with get_db() as db:
+        for code in dict.fromkeys(codes):
+            order = await db_fetchone(db, "SELECT id FROM orders WHERE UPPER(tracking_code)=UPPER(?)", (code,))
+            if not order:
+                fail += 1
+                continue
+            await db.execute("INSERT OR IGNORE INTO batch_orders (batch_id, order_id, created_at) VALUES (?, ?, ?)", (batch_id, order["id"], now_iso()))
+            ok += 1
+        await db.commit()
+    return ok, fail
+
+
+async def get_batch_orders(batch_id: int) -> list[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchall(
+            db,
+            """
+            SELECT o.* FROM orders o
+            JOIN batch_orders bo ON bo.order_id=o.id
+            WHERE bo.batch_id=?
+            ORDER BY o.id DESC
+            """,
+            (batch_id,),
+        )
+
+
+async def update_batch_status(batch_id: int, status: str, actor_id: int) -> tuple[Optional[aiosqlite.Row], list[aiosqlite.Row]]:
+    batch = await get_batch(batch_id)
+    if not batch:
+        return None, []
+    orders = await get_batch_orders(batch_id)
+    updated_orders = []
+    async with get_db() as db:
+        await db.execute("UPDATE batches SET status=?, updated_at=? WHERE id=?", (status, now_iso(), batch_id))
+        await db.commit()
+    for order in orders:
+        updated = await update_order_status(order["id"], status, actor_id, f"Статус изменён по партии #{batch_id}")
+        if updated:
+            updated_orders.append(updated)
+    return await get_batch(batch_id), updated_orders
+
+
+def format_batch(batch: aiosqlite.Row, count: int = 0) -> str:
+    return (
+        f"<b>📦 Партия #{batch['id']}</b>\n"
+        f"Название: {safe(batch['name'])}\n"
+        f"Маршрут: {safe(auto_route_label(batch['route_key'] or 'cis_local'))}\n"
+        f"Статус: <b>{safe(batch['status'])}</b>\n"
+        f"Грузов: {count}\n"
+        f"Создана: {safe((batch['created_at'] or '')[:16].replace('T', ' '))}"
+    )
+
+
+async def list_clients(limit: int = 10, query: str = "") -> list[aiosqlite.Row]:
+    async with get_db() as db:
+        if query:
+            like = f"%{query.lower()}%"
+            return await db_fetchall(
+                db,
+                """
+                SELECT u.telegram_id, u.username, u.full_name, u.role, COUNT(o.id) AS orders_count,
+                       COALESCE(SUM(o.price),0) AS revenue,
+                       COALESCE(SUM(o.price - COALESCE(o.paid_amount,0)),0) AS debt
+                FROM users u
+                LEFT JOIN orders o ON o.user_id=u.telegram_id
+                WHERE u.role IN ('client','partner')
+                  AND (LOWER(COALESCE(u.username,'')) LIKE ? OR LOWER(COALESCE(u.full_name,'')) LIKE ? OR CAST(u.telegram_id AS TEXT) LIKE ?)
+                GROUP BY u.telegram_id
+                ORDER BY orders_count DESC, u.updated_at DESC
+                LIMIT ?
+                """,
+                (like, like, like, limit),
+            )
+        return await db_fetchall(
+            db,
+            """
+            SELECT u.telegram_id, u.username, u.full_name, u.role, COUNT(o.id) AS orders_count,
+                   COALESCE(SUM(o.price),0) AS revenue,
+                   COALESCE(SUM(o.price - COALESCE(o.paid_amount,0)),0) AS debt
+            FROM users u
+            LEFT JOIN orders o ON o.user_id=u.telegram_id
+            WHERE u.role IN ('client','partner')
+            GROUP BY u.telegram_id
+            ORDER BY orders_count DESC, u.updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+
+def format_client_row(row: aiosqlite.Row) -> str:
+    name = row['full_name'] or ''
+    username = f"@{row['username']}" if row['username'] else ''
+    debt = max(float(row['debt'] or 0), 0)
+    return f"<b>{safe(name or username or row['telegram_id'])}</b> · ID <code>{row['telegram_id']}</code>\nЗаказов: {row['orders_count']} · Долг: {debt} {safe(CURRENCY)}"
 
 async def disable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
     order = await get_order(order_id)
@@ -1598,6 +1849,7 @@ class WeightForm(StatesGroup):
 
 
 class BroadcastForm(StatesGroup):
+    audience = State()
     text = State()
 
 
@@ -1645,6 +1897,29 @@ class CourierAssignForm(StatesGroup):
 
 class CourierDeliveredForm(StatesGroup):
     code = State()
+
+
+class BatchCreateForm(StatesGroup):
+    name = State()
+    route = State()
+    codes = State()
+
+
+class BatchAddForm(StatesGroup):
+    batch_id = State()
+    codes = State()
+
+
+class BatchStatusForm(StatesGroup):
+    batch_id = State()
+
+
+class StatusSettingsForm(StatesGroup):
+    name = State()
+
+
+class ClientSearchForm(StatesGroup):
+    query = State()
 
 
 # =========================
@@ -1741,6 +2016,9 @@ async def cmd_help_admin(message: Message):
         "/assigncourier CG... 123456789 адрес — назначить курьера\n"
         "🤖 Автостатусы — включить по кнопке без команд\n"
         "📦 Все грузы → карточка груза → 🤖 Включить автостатусы\n"
+        "📦 Партии — вести грузы партиями и менять статус всем сразу\n"
+        "👥 Клиенты — база клиентов и поиск\n"
+        "⚙️ Статусы — добавить свои статусы через кнопки\n"
     )
 
 
@@ -2143,7 +2421,7 @@ async def cmd_debts(message: Message):
     lines = []
     for o in rows:
         lines.append(f"{safe(o['tracking_code'])} | долг: {o['debt']} {safe(CURRENCY)} | клиент: {safe(o['customer_name'])} {safe(o['phone'])}")
-    await message.answer("<b>💸 Неоплаченные заказы</b>\n\n" + "\n".join(lines))
+    await message.answer("<b>💸 Неоплаченные заказы</b>\n\n" + "\n".join(lines), reply_markup=debts_keyboard(rows))
 
 
 @router.message(Command("export_orders"))
@@ -2927,10 +3205,10 @@ async def tariffs_menu(message: Message, state: FSMContext):
     await state.clear()
     rows = await list_tariffs()
     lines = [f"— {safe(r['country_name'])}: {r['rate']} {safe(CURRENCY)}/кг" for r in rows]
-    await state.set_state(TariffForm.country)
     await message.answer(
         "<b>⚙️ Тарифы</b>\n\n" + ("\n".join(lines) if lines else "Тарифов пока нет.") +
-        "\n\nЧтобы добавить/изменить тариф, напишите страну. Например: Китай\nДля отмены: /admin"
+        "\n\nВыберите действие кнопкой ниже.",
+        reply_markup=tariffs_panel_keyboard(),
     )
 
 
@@ -3153,7 +3431,8 @@ async def status_code(message: Message, state: FSMContext):
         return
     await state.update_data(order_id=order["id"], code=code)
     await state.set_state(StatusForm.status)
-    await message.answer("Выберите статус:", reply_markup=status_keyboard(order["id"]))
+    statuses = await get_all_statuses()
+    await message.answer("Выберите статус:", reply_markup=status_keyboard(order["id"], statuses))
 
 
 @router.message(StatusForm.status)
@@ -3259,8 +3538,24 @@ async def broadcast_start(message: Message, state: FSMContext):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await state.clear()
+    await message.answer(
+        "<b>📢 Рассылка</b>\n\nВыберите аудиторию кнопкой ниже. Потом отправьте текст сообщения.",
+        reply_markup=broadcast_audience_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("broadcast_audience:"))
+async def cb_broadcast_audience(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    audience = call.data.split(":", 1)[1]
+    await state.clear()
+    await state.update_data(audience=audience)
     await state.set_state(BroadcastForm.text)
-    await message.answer("Введите текст рассылки. Для отмены: /start")
+    labels = {"all": "всем клиентам", "active": "клиентам с активными грузами", "debtors": "должникам", "partners": "партнёрам"}
+    await call.message.answer(f"Аудитория: <b>{safe(labels.get(audience, audience))}</b>.\n\nТеперь отправьте текст рассылки одним сообщением. Для отмены: /admin")
+    await call.answer()
 
 
 @router.message(BroadcastForm.text)
@@ -3268,8 +3563,17 @@ async def broadcast_finish(message: Message, state: FSMContext, bot: Bot):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     text = message.text or ""
+    data = await state.get_data()
+    audience = data.get("audience", "all")
     async with get_db() as db:
-        users = await db_fetchall(db, "SELECT telegram_id FROM users WHERE role IN ('client', 'partner')")
+        if audience == "active":
+            users = await db_fetchall(db, "SELECT DISTINCT user_id AS telegram_id FROM orders WHERE status NOT IN ('доставлен','отменён')")
+        elif audience == "debtors":
+            users = await db_fetchall(db, "SELECT DISTINCT user_id AS telegram_id FROM orders WHERE price > COALESCE(paid_amount,0)")
+        elif audience == "partners":
+            users = await db_fetchall(db, "SELECT telegram_id FROM users WHERE role='partner'")
+        else:
+            users = await db_fetchall(db, "SELECT telegram_id FROM users WHERE role IN ('client', 'partner')")
     sent = 0
     failed = 0
     for user in users:
@@ -3281,6 +3585,381 @@ async def broadcast_finish(message: Message, state: FSMContext, bot: Bot):
             failed += 1
     await state.clear()
     await message.answer(f"✅ Рассылка завершена. Отправлено: {sent}, ошибок: {failed}", reply_markup=admin_keyboard())
+
+
+
+@router.message(F.text == "📦 Партии")
+async def batches_menu(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    batches = await list_batches(8)
+    text = (
+        "<b>📦 Партии грузов</b>\n\n"
+        "Партии нужны, чтобы не менять статус каждому грузу отдельно. "
+        "Создайте партию, добавьте в неё номера CG..., потом меняйте статус всей партии одной кнопкой."
+    )
+    await message.answer(text, reply_markup=batch_panel_keyboard(batches))
+
+
+@router.callback_query(F.data == "batch_create")
+async def cb_batch_create(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(BatchCreateForm.name)
+    await call.message.answer("Введите название партии. Например: Китай 05.05 или Турция май")
+    await call.answer()
+
+
+@router.message(BatchCreateForm.name)
+async def batch_create_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await state.set_state(BatchCreateForm.route)
+    await message.answer(
+        "Введите направление партии:\n"
+        "1 — Китай → СНГ\n2 — Турция → СНГ\n3 — Дубай/ОАЭ → СНГ\n4 — СНГ → СНГ\n\n"
+        "Можно также написать: china, turkey, uae, cis"
+    )
+
+
+def parse_route_choice(text: str) -> str:
+    t = normalize(text)
+    if t in {"1", "china", "китай", "china_cis"}:
+        return "china_cis"
+    if t in {"2", "turkey", "турция", "turkey_cis"}:
+        return "turkey_cis"
+    if t in {"3", "uae", "дубай", "оаэ", "uae_cis"}:
+        return "uae_cis"
+    return "cis_local"
+
+
+@router.message(BatchCreateForm.route)
+async def batch_create_route(message: Message, state: FSMContext):
+    if not message.from_user:
+        return
+    data = await state.get_data()
+    route_key = parse_route_choice(message.text or "")
+    batch = await create_batch(data["name"], route_key, message.from_user.id)
+    await state.update_data(batch_id=batch["id"])
+    await state.set_state(BatchCreateForm.codes)
+    await message.answer(
+        f"✅ Партия создана: <b>#{batch['id']} {safe(batch['name'])}</b>\n"
+        f"Маршрут: {safe(auto_route_label(route_key))}\n\n"
+        "Теперь отправьте номера грузов CG... через пробел, запятую или с новой строки.\n"
+        "Если хотите добавить позже — напишите 0."
+    )
+
+
+@router.message(BatchCreateForm.codes)
+async def batch_create_codes(message: Message, state: FSMContext):
+    data = await state.get_data()
+    batch_id = int(data["batch_id"])
+    if (message.text or "").strip() == "0":
+        await state.clear()
+        batch = await get_batch(batch_id)
+        await message.answer(format_batch(batch, 0), reply_markup=batch_actions_keyboard(batch_id))
+        return
+    ok, fail = await add_orders_to_batch(batch_id, message.text or "")
+    orders = await get_batch_orders(batch_id)
+    batch = await get_batch(batch_id)
+    await state.clear()
+    await message.answer(
+        f"✅ В партию добавлено: {ok}. Не найдено: {fail}.\n\n" + format_batch(batch, len(orders)),
+        reply_markup=batch_actions_keyboard(batch_id),
+    )
+
+
+@router.callback_query(F.data == "batch_list")
+async def cb_batch_list(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    batches = await list_batches(10)
+    if not batches:
+        await call.message.answer("Партии пока не созданы.")
+    else:
+        await call.message.answer("<b>📋 Активные партии</b>", reply_markup=batch_panel_keyboard(batches))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("batch_open:"))
+async def cb_batch_open(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    batch_id = int(call.data.split(":", 1)[1])
+    batch = await get_batch(batch_id)
+    if not batch:
+        await call.answer("Партия не найдена", show_alert=True)
+        return
+    orders = await get_batch_orders(batch_id)
+    await call.message.answer(format_batch(batch, len(orders)), reply_markup=batch_actions_keyboard(batch_id))
+    await call.answer()
+
+
+@router.callback_query(F.data == "batch_add_orders")
+async def cb_batch_add_choose(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(BatchAddForm.batch_id)
+    await call.message.answer("Введите номер партии. Например: 1")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("batch_add_to:"))
+async def cb_batch_add_to(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    batch_id = int(call.data.split(":", 1)[1])
+    await state.clear()
+    await state.update_data(batch_id=batch_id)
+    await state.set_state(BatchAddForm.codes)
+    await call.message.answer("Отправьте номера грузов CG... через пробел, запятую или с новой строки.")
+    await call.answer()
+
+
+@router.message(BatchAddForm.batch_id)
+async def batch_add_id(message: Message, state: FSMContext):
+    if not (message.text or "").strip().isdigit():
+        await message.answer("Введите только номер партии. Например: 1")
+        return
+    batch = await get_batch(int(message.text.strip()))
+    if not batch:
+        await message.answer("Партия не найдена. Введите другой номер.")
+        return
+    await state.update_data(batch_id=batch["id"])
+    await state.set_state(BatchAddForm.codes)
+    await message.answer("Теперь отправьте номера грузов CG... через пробел, запятую или с новой строки.")
+
+
+@router.message(BatchAddForm.codes)
+async def batch_add_codes(message: Message, state: FSMContext):
+    data = await state.get_data()
+    batch_id = int(data["batch_id"])
+    ok, fail = await add_orders_to_batch(batch_id, message.text or "")
+    orders = await get_batch_orders(batch_id)
+    batch = await get_batch(batch_id)
+    await state.clear()
+    await message.answer(
+        f"✅ Добавлено в партию: {ok}. Не найдено: {fail}.\n\n" + format_batch(batch, len(orders)),
+        reply_markup=batch_actions_keyboard(batch_id),
+    )
+
+
+@router.callback_query(F.data == "batch_change_status")
+async def cb_batch_status_choose(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(BatchStatusForm.batch_id)
+    await call.message.answer("Введите номер партии, которой нужно сменить статус.")
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("batch_status_for:"))
+async def cb_batch_status_for(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    batch_id = int(call.data.split(":", 1)[1])
+    statuses = await get_all_statuses()
+    await call.message.answer("Выберите новый статус для всей партии:", reply_markup=batch_status_keyboard(batch_id, statuses))
+    await call.answer()
+
+
+@router.message(BatchStatusForm.batch_id)
+async def batch_status_id(message: Message, state: FSMContext):
+    if not (message.text or "").strip().isdigit():
+        await message.answer("Введите только номер партии. Например: 1")
+        return
+    batch_id = int(message.text.strip())
+    batch = await get_batch(batch_id)
+    if not batch:
+        await message.answer("Партия не найдена. Введите другой номер.")
+        return
+    await state.clear()
+    statuses = await get_all_statuses()
+    await message.answer("Выберите новый статус для всей партии:", reply_markup=batch_status_keyboard(batch_id, statuses))
+
+
+@router.callback_query(F.data.startswith("batch_set_status:"))
+async def cb_batch_set_status(call: CallbackQuery, bot: Bot):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    _, batch_id_raw, status = call.data.split(":", 2)
+    batch_id = int(batch_id_raw)
+    batch, orders = await update_batch_status(batch_id, status, call.from_user.id)
+    if not batch:
+        await call.answer("Партия не найдена", show_alert=True)
+        return
+    for order in orders:
+        await notify_user(bot, order["user_id"], f"📦 Статус груза <b>{safe(order['tracking_code'])}</b> обновлён по партии: <b>{safe(status)}</b>")
+        await asyncio.sleep(0.04)
+    await call.message.answer(f"✅ Статус партии #{batch_id} изменён на <b>{safe(status)}</b>.\nУведомлено грузов: {len(orders)}")
+    await call.answer("Готово")
+
+
+@router.callback_query(F.data.startswith("batch_orders:"))
+async def cb_batch_orders(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    batch_id = int(call.data.split(":", 1)[1])
+    orders = await get_batch_orders(batch_id)
+    if not orders:
+        await call.message.answer("В этой партии пока нет грузов.")
+    else:
+        await call.message.answer("<b>📋 Грузы в партии</b>\n\n" + "\n".join(format_short_order(o) for o in orders[:30]))
+    await call.answer()
+
+
+@router.message(F.text == "👥 Клиенты")
+async def clients_menu(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    rows = await list_clients(10)
+    text = "<b>👥 База клиентов</b>\n\n" + ("\n\n".join(format_client_row(r) for r in rows) if rows else "Клиентов пока нет.")
+    await state.set_state(ClientSearchForm.query)
+    await message.answer(text + "\n\nЧтобы найти клиента, отправьте имя, username или Telegram ID. Для выхода: /admin")
+
+
+@router.message(ClientSearchForm.query)
+async def clients_search(message: Message, state: FSMContext):
+    query = (message.text or "").strip()
+    rows = await list_clients(10, query=query)
+    if not rows:
+        await message.answer("Клиенты не найдены. Попробуйте другой запрос или /admin для выхода.")
+        return
+    await message.answer("<b>🔎 Найденные клиенты</b>\n\n" + "\n\n".join(format_client_row(r) for r in rows))
+
+
+@router.message(F.text == "⚙️ Статусы")
+async def statuses_settings_menu(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    custom = await get_custom_statuses()
+    all_statuses = await get_all_statuses()
+    await message.answer(
+        "<b>⚙️ Статусы</b>\n\n"
+        "Здесь можно добавить свои статусы под компанию. Они появятся в кнопках смены статуса.\n\n"
+        + "\n".join(f"— {safe(st)}" for st in all_statuses),
+        reply_markup=statuses_panel_keyboard(custom),
+    )
+
+
+@router.callback_query(F.data == "status_add")
+async def cb_status_add(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(StatusSettingsForm.name)
+    await call.message.answer("Напишите новый статус. Например: принят в Гуанчжоу")
+    await call.answer()
+
+
+@router.message(StatusSettingsForm.name)
+async def status_add_finish(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await add_custom_status(message.text or "")
+    await state.clear()
+    await message.answer("✅ Статус добавлен. Он появится в меню смены статуса.", reply_markup=admin_keyboard())
+
+
+@router.callback_query(F.data == "status_list")
+async def cb_status_list(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    statuses = await get_all_statuses()
+    await call.message.answer("<b>📋 Все статусы</b>\n\n" + "\n".join(f"— {safe(st)}" for st in statuses))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("status_delete:"))
+async def cb_status_delete(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    status_id = int(call.data.split(":", 1)[1])
+    await delete_custom_status(status_id)
+    custom = await get_custom_statuses()
+    await call.message.answer("✅ Статус удалён.", reply_markup=statuses_panel_keyboard(custom))
+    await call.answer()
+
+
+@router.callback_query(F.data == "tariff_add")
+async def cb_tariff_add(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(TariffForm.country)
+    await call.message.answer("Напишите страну/направление для тарифа. Например: Китай")
+    await call.answer()
+
+
+@router.callback_query(F.data == "tariff_list")
+async def cb_tariff_list(call: CallbackQuery):
+    rows = await list_tariffs()
+    lines = [f"— {safe(r['country_name'])}: {r['rate']} {safe(CURRENCY)}/кг" for r in rows]
+    await call.message.answer("<b>⚙️ Тарифы</b>\n\n" + ("\n".join(lines) if lines else "Тарифов пока нет."))
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("pay_remind:"))
+async def cb_pay_remind(call: CallbackQuery, bot: Bot):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    debt = max(float(order["price"] or 0) - float(order["paid_amount"] or 0), 0)
+    if debt <= 0:
+        await call.answer("Долга нет", show_alert=True)
+        return
+    await notify_user(
+        bot,
+        order["user_id"],
+        f"💰 Напоминание об оплате по грузу <b>{safe(order['tracking_code'])}</b>.\n"
+        f"К оплате осталось: <b>{debt} {safe(CURRENCY)}</b>.\n"
+        "Если вы уже оплатили, отправьте подтверждение менеджеру или в техподдержку.",
+    )
+    await call.answer("Напоминание отправлено")
+    await call.message.answer(f"✅ Напоминание отправлено клиенту по грузу {safe(order['tracking_code'])}.")
+
+
+@router.callback_query(F.data.startswith("support_tpl:"))
+async def cb_support_template(call: CallbackQuery, bot: Bot):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    _, ticket_id_raw, key = call.data.split(":", 2)
+    ticket_id = int(ticket_id_raw)
+    text = SUPPORT_REPLY_TEMPLATES.get(key)
+    if not text:
+        await call.answer("Шаблон не найден", show_alert=True)
+        return
+    ticket = await add_support_message(ticket_id, call.from_user.id, "admin", text, "answered")
+    if not ticket:
+        await call.answer("Обращение не найдено", show_alert=True)
+        return
+    await notify_user(bot, ticket["user_id"], f"🛠️ Ответ техподдержки по обращению №{ticket_id}:\n\n{safe(text)}")
+    await call.answer("Ответ отправлен")
+    await call.message.answer(f"✅ Быстрый ответ отправлен по обращению №{ticket_id}.")
 
 
 @router.message(F.text == "📸 Добавить фото")
@@ -3495,7 +4174,8 @@ async def cb_open_status(call: CallbackQuery):
         await call.answer("Нет доступа", show_alert=True)
         return
     order_id = int(call.data.split(":", 1)[1])
-    await call.message.answer("Выберите новый статус:", reply_markup=status_keyboard(order_id))
+    statuses = await get_all_statuses()
+    await call.message.answer("Выберите новый статус:", reply_markup=status_keyboard(order_id, statuses))
     await call.answer()
 
 
