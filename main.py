@@ -299,6 +299,16 @@ def track_button(code: str) -> InlineKeyboardMarkup:
     )
 
 
+def status_notify_text(code: str, status: str, comment: str = "") -> str:
+    text = (
+        f"📦 Статус груза <b>{safe(code)}</b> обновлён.\n"
+        f"Новый статус: <b>{safe(status)}</b>"
+    )
+    if comment:
+        text += f"\n{safe(comment)}"
+    return text
+
+
 def client_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -415,6 +425,24 @@ def courier_menu_text() -> str:
         f"<b>🚚 Курьерское меню</b>\n\n"
         "Здесь курьер видит свои доставки, адреса и может отметить груз доставленным."
     )
+
+
+async def menu_for_user(user_id: int, name: str = "") -> tuple[str, ReplyKeyboardMarkup]:
+    """Возвращает правильное стартовое меню по роли пользователя.
+
+    Админ при /start видит админку, склад — складское меню,
+    курьер — курьерское меню, обычный клиент — клиентское меню.
+    """
+    if is_admin(user_id):
+        return admin_menu_text(), admin_keyboard()
+
+    if is_warehouse(user_id) or await has_role(user_id, "warehouse"):
+        return warehouse_menu_text(), warehouse_keyboard()
+
+    if is_courier_static(user_id) or await has_role(user_id, "courier"):
+        return courier_menu_text(), courier_keyboard()
+
+    return client_menu_text(name), client_keyboard()
 
 
 def status_keyboard(order_id: int, statuses: Optional[list[str]] = None) -> InlineKeyboardMarkup:
@@ -1600,9 +1628,9 @@ async def notify_admins(bot: Bot, text: str, reply_markup: Optional[InlineKeyboa
             logger.warning("Failed to notify admin %s: %s", admin_id, e)
 
 
-async def notify_user(bot: Bot, user_id: int, text: str) -> None:
+async def notify_user(bot: Bot, user_id: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
-        await bot.send_message(user_id, text)
+        await bot.send_message(user_id, text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning("Failed to notify user %s: %s", user_id, e)
 
@@ -1964,16 +1992,23 @@ async def cmd_start(message: Message, state: FSMContext, command: CommandObject 
             ref_partner_id = int(raw)
     await upsert_user(message, ref_partner_id)
 
+    user_id = message.from_user.id if message.from_user else 0
+    name = message.from_user.first_name if message.from_user else ""
+    menu_text, menu_keyboard = await menu_for_user(user_id, name)
+
     if args and args.startswith("track_"):
         code = args.replace("track_", "", 1).strip().upper()
         order = await get_order_by_code(code)
         if order:
             rows = await get_status_history(order["id"])
-            await message.answer(format_order(order) + "\n\n<b>🕓 История:</b>\n" + format_history(rows), reply_markup=client_keyboard())
+            await message.answer(
+                format_order(order) + "\n\n<b>🕓 История:</b>\n" + format_history(rows),
+                reply_markup=track_button(order["tracking_code"]),
+            )
+            await message.answer(menu_text, reply_markup=menu_keyboard)
             return
 
-    name = message.from_user.first_name if message.from_user else ""
-    await message.answer(client_menu_text(name), reply_markup=client_keyboard())
+    await message.answer(menu_text, reply_markup=menu_keyboard)
 
 
 @router.message(Command("admin"))
@@ -2078,7 +2113,8 @@ async def cmd_setstatus(message: Message, bot: Bot):
     await notify_user(
         bot,
         updated["user_id"],
-        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
+        status_notify_text(updated["tracking_code"], status, comment),
+        reply_markup=track_button(updated["tracking_code"]),
     )
 
 
@@ -2647,14 +2683,10 @@ async def cargo_phone(message: Message, state: FSMContext, bot: Bot):
     await message.answer(
         f"✅ Заявка создана.\n\n"
         f"Ваш номер груза: <b>{safe(order['tracking_code'])}</b>\n"
-        f"Предварительный тариф: {rate} {safe(CURRENCY)}/кг\n"
-        f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n\n"
-        f"🔎 Отследить груз можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
-        "Больше ничего вводить не нужно: сохраните эту ссылку и открывайте её в браузере.\n\n"
-        "Итоговая цена может измениться после взвешивания и проверки груза на складе.",
+        f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n"
+        "Нажмите кнопку ниже, чтобы отследить груз.",
         reply_markup=track_button(order['tracking_code']),
     )
-    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -2723,8 +2755,7 @@ async def track_finish(message: Message, state: FSMContext):
     if not order:
         await message.answer("Груз не найден. Проверьте номер или напишите менеджеру.", reply_markup=client_keyboard())
         return
-    await message.answer(format_order(order) + f"\n\n🔎 Прямая ссылка:\n{safe(track_url(order['tracking_code']))}", reply_markup=track_button(order['tracking_code']))
-    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
+    await message.answer(format_order(order), reply_markup=track_button(order['tracking_code']))
 
 
 @router.message(F.text == "📋 Мои заказы")
@@ -2791,13 +2822,12 @@ async def buyout_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на выкуп создана.\n"
-        f"Номер: <b>{safe(order['tracking_code'])}</b>\n\n"
-        f"🔎 Отследить заявку можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
-        "Менеджер проверит товар, стоимость, комиссию и доставку.",
+        f"✅ Заявка на выкуп создана.\n\n"
+        f"Номер: <b>{safe(order['tracking_code'])}</b>\n"
+        "Менеджер проверит товар, стоимость и доставку.\n"
+        "Нажмите кнопку ниже, чтобы отследить заявку.",
         reply_markup=track_button(order['tracking_code']),
     )
-    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -2890,13 +2920,12 @@ async def wholesale_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на оптовую доставку создана.\n"
-        f"Номер: <b>{safe(order['tracking_code'])}</b>\n\n"
-        f"🔎 Отследить заявку можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
-        "Менеджер проверит маршрут, документы, тариф и условия.",
+        f"✅ Заявка на оптовую доставку создана.\n\n"
+        f"Номер: <b>{safe(order['tracking_code'])}</b>\n"
+        "Менеджер проверит маршрут, документы и тариф.\n"
+        "Нажмите кнопку ниже, чтобы отследить заявку.",
         reply_markup=track_button(order['tracking_code']),
     )
-    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -3492,7 +3521,8 @@ async def status_manual_finish(message: Message, state: FSMContext, bot: Bot):
     await notify_user(
         bot,
         updated["user_id"],
-        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(updated['status'])}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
+        status_notify_text(updated["tracking_code"], updated["status"], comment),
+        reply_markup=track_button(updated["tracking_code"]),
     )
 
 
@@ -3838,7 +3868,12 @@ async def cb_batch_set_status(call: CallbackQuery, bot: Bot):
         await call.answer("Партия не найдена", show_alert=True)
         return
     for order in orders:
-        await notify_user(bot, order["user_id"], f"📦 Статус груза <b>{safe(order['tracking_code'])}</b> обновлён по партии: <b>{safe(status)}</b>\n\n🔎 Отследить: {safe(track_url(order['tracking_code']))}")
+        await notify_user(
+            bot,
+            order["user_id"],
+            status_notify_text(order["tracking_code"], status, "Статус обновлён по партии."),
+            reply_markup=track_button(order["tracking_code"]),
+        )
         await asyncio.sleep(0.04)
     await call.message.answer(f"✅ Статус партии #{batch_id} изменён на <b>{safe(status)}</b>.\nУведомлено грузов: {len(orders)}")
     await call.answer("Готово")
@@ -4400,7 +4435,8 @@ async def process_auto_statuses(bot: Bot) -> int:
             await notify_user(
                 bot,
                 updated["user_id"],
-                f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
+                status_notify_text(updated["tracking_code"], status, comment),
+                reply_markup=track_button(updated["tracking_code"]),
             )
         except Exception as e:
             logger.exception("Auto status failed for order %s: %s", order["id"], e)
