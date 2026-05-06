@@ -4383,6 +4383,194 @@ async def auto_status_loop(bot: Bot) -> None:
         await asyncio.sleep(max(10, AUTO_STATUS_INTERVAL_SECONDS))
 
 
+
+# =========================
+# PUBLIC WEB TRACKING MODULE
+# =========================
+def _web_response(html_text: str, status: int = 200) -> web.Response:
+    return web.Response(
+        text=html_text,
+        status=status,
+        content_type="text/html",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+def _status_badge_color(status: str) -> str:
+    s = normalize(status)
+    if "готов" in s or "достав" in s:
+        return "#1fbf75"
+    if "проблем" in s or "отмен" in s or "задерж" in s:
+        return "#ff4d4f"
+    if "тамож" in s:
+        return "#ffb020"
+    if "пути" in s or "отправ" in s:
+        return "#2f80ed"
+    return "#6c7a89"
+
+
+def _track_layout(title: str, content: str) -> str:
+    company = html.escape(COMPANY_NAME)
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{html.escape(title)} — {company}</title>
+  <style>
+    :root {{
+      --bg:#071527;
+      --card:#ffffff;
+      --muted:#64748b;
+      --text:#102033;
+      --blue:#1e88e5;
+      --cyan:#00bcd4;
+      --line:#e8eef6;
+    }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; font-family:Arial, sans-serif; background:linear-gradient(135deg,#071527,#0b284a 55%,#073f5d); color:var(--text); }}
+    .wrap {{ min-height:100vh; display:flex; align-items:center; justify-content:center; padding:24px; }}
+    .shell {{ width:100%; max-width:860px; }}
+    .hero {{ color:#fff; margin-bottom:18px; }}
+    .hero h1 {{ margin:0 0 8px; font-size:34px; line-height:1.08; }}
+    .hero p {{ margin:0; color:#c7d7ea; font-size:16px; }}
+    .card {{ background:var(--card); border-radius:24px; padding:24px; box-shadow:0 24px 70px rgba(0,0,0,.28); }}
+    .form {{ display:flex; gap:10px; margin-top:18px; }}
+    input {{ flex:1; padding:16px 18px; border:1px solid var(--line); border-radius:14px; font-size:16px; outline:none; }}
+    input:focus {{ border-color:var(--blue); box-shadow:0 0 0 3px rgba(30,136,229,.12); }}
+    button {{ padding:16px 20px; border:0; border-radius:14px; background:linear-gradient(135deg,var(--blue),var(--cyan)); color:#fff; font-weight:700; font-size:16px; cursor:pointer; }}
+    .hint {{ color:var(--muted); font-size:14px; margin-top:12px; }}
+    .grid {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:16px; }}
+    .item {{ background:#f8fbff; border:1px solid var(--line); border-radius:16px; padding:14px; }}
+    .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; margin-bottom:6px; }}
+    .value {{ font-size:17px; font-weight:700; color:#0f2744; }}
+    .status {{ display:inline-flex; align-items:center; gap:8px; color:white; border-radius:999px; padding:10px 14px; font-weight:700; }}
+    .history {{ margin-top:20px; border-top:1px solid var(--line); padding-top:16px; }}
+    .hrow {{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid #f0f3f7; }}
+    .dot {{ width:10px; height:10px; border-radius:50%; background:var(--blue); margin-top:5px; flex:0 0 auto; }}
+    .hdate {{ color:var(--muted); font-size:13px; min-width:132px; }}
+    .hstatus {{ font-weight:700; }}
+    .error {{ background:#fff3f3; border:1px solid #ffd4d4; color:#a01616; border-radius:16px; padding:16px; }}
+    .footer {{ text-align:center; color:#bed1e5; font-size:12px; margin-top:14px; }}
+    a {{ color:var(--blue); text-decoration:none; }}
+    @media (max-width:640px) {{
+      .wrap {{ padding:16px; align-items:flex-start; }}
+      .hero h1 {{ font-size:27px; }}
+      .form {{ flex-direction:column; }}
+      .grid {{ grid-template-columns:1fr; }}
+      .hrow {{ display:block; }}
+      .hdate {{ margin-bottom:4px; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="shell">
+      <div class="hero">
+        <h1>{company}</h1>
+        <p>Проверка статуса груза по номеру заказа</p>
+      </div>
+      <div class="card">{content}</div>
+      <div class="footer">CargoPilot Web Track + Telegram-админка для сотрудников</div>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def _track_form(code: str = "", error: str = "") -> str:
+    err = f'<div class="error">{html.escape(error)}</div>' if error else ""
+    return f"""
+      <h2 style="margin:0 0 8px;">Отследить груз</h2>
+      <div class="hint">Введите номер груза, например <b>CG26050500001</b>.</div>
+      {err}
+      <form class="form" method="get" action="/track">
+        <input name="code" value="{html.escape(code or '')}" placeholder="Номер груза CG..." autocomplete="off" />
+        <button type="submit">Проверить</button>
+      </form>
+      <div class="hint">Если номер не найден, свяжитесь с менеджером карго-компании.</div>
+    """
+
+
+async def landing_page(_: web.Request) -> web.Response:
+    return _web_response(_track_layout("Проверка груза", _track_form()))
+
+
+async def track_page(request: web.Request) -> web.Response:
+    code = (request.query.get("code") or "").strip().upper()
+    if not code:
+        return _web_response(_track_layout("Проверка груза", _track_form()))
+    return await render_tracking_result(code)
+
+
+async def track_code_page(request: web.Request) -> web.Response:
+    code = (request.match_info.get("code") or "").strip().upper()
+    return await render_tracking_result(code)
+
+
+async def render_tracking_result(code: str) -> web.Response:
+    order = await get_order_by_code(code)
+    if not order:
+        return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
+    async with get_db() as db:
+        history = await db_fetchall(
+            db,
+            "SELECT status, comment, created_at FROM status_history WHERE order_id=? ORDER BY id ASC",
+            (order["id"],),
+        )
+    status = order["status"] or "новая заявка"
+    badge_color = _status_badge_color(status)
+    route = f"{html.escape(str(order['from_country'] or '—'))} → {html.escape(str(order['to_city'] or '—'))}"
+    updated = html.escape(((order["updated_at"] or order["created_at"] or "")[:16]).replace("T", " "))
+    history_html = ""
+    if history:
+        rows = []
+        for h in history:
+            dt = html.escape(((h["created_at"] or "")[:16]).replace("T", " "))
+            st = html.escape(h["status"] or "")
+            comment = html.escape(h["comment"] or "")
+            rows.append(f'<div class="hrow"><div class="dot"></div><div class="hdate">{dt}</div><div><div class="hstatus">{st}</div><div class="hint">{comment}</div></div></div>')
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3>' + "".join(rows) + "</div>"
+    else:
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3><div class="hint">История пока пустая.</div></div>'
+    content = f"""
+      <h2 style="margin:0 0 8px;">Груз {html.escape(order['tracking_code'])}</h2>
+      <div class="status" style="background:{badge_color};">● {html.escape(status)}</div>
+      <div class="grid">
+        <div class="item"><div class="label">Маршрут</div><div class="value">{route}</div></div>
+        <div class="item"><div class="label">Товар</div><div class="value">{html.escape(str(order['cargo_type'] or '—'))}</div></div>
+        <div class="item"><div class="label">Вес</div><div class="value">{html.escape(str(order['weight'] or '—'))} кг</div></div>
+        <div class="item"><div class="label">Последнее обновление</div><div class="value">{updated or '—'}</div></div>
+      </div>
+      {history_html}
+      <form class="form" method="get" action="/track" style="margin-top:20px;">
+        <input name="code" placeholder="Проверить другой номер CG..." autocomplete="off" />
+        <button type="submit">Проверить</button>
+      </form>
+    """
+    return _web_response(_track_layout(f"Груз {order['tracking_code']}", content))
+
+
+async def api_track_order(request: web.Request) -> web.Response:
+    code = (request.match_info.get("code") or "").strip().upper()
+    order = await get_order_by_code(code)
+    if not order:
+        return web.json_response({"ok": False, "error": "not_found"}, status=404)
+    async with get_db() as db:
+        history = await db_fetchall(db, "SELECT status, comment, created_at FROM status_history WHERE order_id=? ORDER BY id ASC", (order["id"],))
+    return web.json_response({
+        "ok": True,
+        "tracking_code": order["tracking_code"],
+        "status": order["status"],
+        "from_country": order["from_country"],
+        "to_city": order["to_city"],
+        "cargo_type": order["cargo_type"],
+        "weight": order["weight"],
+        "updated_at": order["updated_at"],
+        "history": [{"status": h["status"], "comment": h["comment"], "created_at": h["created_at"]} for h in history],
+    })
+
 # =========================
 # HEALTH SERVER
 # =========================
@@ -4391,10 +4579,13 @@ async def health(_: web.Request) -> web.Response:
 
 
 async def start_health_server(bot: Bot) -> None:
-    # Нужен только для health-check на Render/Koyeb/VPS. Веб-панели в этой версии нет.
+    # Публичный модуль отслеживания для сайта клиента + health-check для хостинга.
     app = web.Application()
     app["bot"] = bot
-    app.router.add_get("/", health)
+    app.router.add_get("/", landing_page)
+    app.router.add_get("/track", track_page)
+    app.router.add_get("/track/{code}", track_code_page)
+    app.router.add_get("/api/track/{code}", api_track_order)
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
