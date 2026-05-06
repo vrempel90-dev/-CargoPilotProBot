@@ -60,6 +60,16 @@ RECEIPT_DIR.mkdir(parents=True, exist_ok=True)
 PORT = int(os.getenv("PORT", "8080"))
 CURRENCY = os.getenv("CURRENCY", "$").strip() or "$"
 
+# Публичная ссылка для веб-трекинга.
+# Для Railway можно оставить дефолт или задать свою ссылку в Variables:
+# PUBLIC_BASE_URL=https://your-service.up.railway.app
+PUBLIC_BASE_URL = (
+    os.getenv("PUBLIC_BASE_URL")
+    or os.getenv("PUBLIC_WEB_URL")
+    or os.getenv("PUBLIC_TRACK_BASE_URL")
+    or "https://cargopilotprobot-production.up.railway.app"
+).strip().rstrip("/")
+
 # Бесплатные автостатусы: бот сам меняет статус по срокам маршрута.
 # Не требует WhatsApp API, OpenAI, Gemini, Kaspi API или других платных сервисов.
 AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -269,6 +279,24 @@ def parse_tracking_code(text: str) -> Optional[str]:
         return text
     return None
 
+
+def track_url(code: str | None = None) -> str:
+    """Публичная ссылка для клиента.
+
+    Клиенту не нужно вводить команды в Telegram: он получает готовую
+    ссылку и открывает статус груза в браузере.
+    """
+    if code:
+        return f"{PUBLIC_BASE_URL}/track/{str(code).strip().upper()}"
+    return f"{PUBLIC_BASE_URL}/track"
+
+
+def track_button(code: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔎 Отследить груз", url=track_url(code))],
+        ]
+    )
 
 
 def client_keyboard() -> ReplyKeyboardMarkup:
@@ -2050,7 +2078,7 @@ async def cmd_setstatus(message: Message, bot: Bot):
     await notify_user(
         bot,
         updated["user_id"],
-        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}",
+        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
     )
 
 
@@ -2375,7 +2403,7 @@ async def cmd_qr(message: Message, bot: Bot):
         await message.answer("⛔ QR можно получить только по своему грузу.")
         return
     me = await bot.get_me()
-    payload = f"https://t.me/{me.username}?start=track_{order['tracking_code']}"
+    payload = track_url(order['tracking_code'])
     qr_bytes = make_qr_bytes(payload)
     await message.answer_photo(BufferedInputFile(qr_bytes, filename=f"{order['tracking_code']}.png"), caption=f"🔳 QR для груза {safe(order['tracking_code'])}")
 
@@ -2621,9 +2649,12 @@ async def cargo_phone(message: Message, state: FSMContext, bot: Bot):
         f"Ваш номер груза: <b>{safe(order['tracking_code'])}</b>\n"
         f"Предварительный тариф: {rate} {safe(CURRENCY)}/кг\n"
         f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n\n"
+        f"🔎 Отследить груз можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
+        "Больше ничего вводить не нужно: сохраните эту ссылку и открывайте её в браузере.\n\n"
         "Итоговая цена может измениться после взвешивания и проверки груза на складе.",
-        reply_markup=client_keyboard(),
+        reply_markup=track_button(order['tracking_code']),
     )
+    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -2692,7 +2723,8 @@ async def track_finish(message: Message, state: FSMContext):
     if not order:
         await message.answer("Груз не найден. Проверьте номер или напишите менеджеру.", reply_markup=client_keyboard())
         return
-    await message.answer(format_order(order), reply_markup=client_keyboard())
+    await message.answer(format_order(order) + f"\n\n🔎 Прямая ссылка:\n{safe(track_url(order['tracking_code']))}", reply_markup=track_button(order['tracking_code']))
+    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
 
 
 @router.message(F.text == "📋 Мои заказы")
@@ -2759,10 +2791,13 @@ async def buyout_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на выкуп создана.\nНомер: <b>{safe(order['tracking_code'])}</b>\n\n"
+        f"✅ Заявка на выкуп создана.\n"
+        f"Номер: <b>{safe(order['tracking_code'])}</b>\n\n"
+        f"🔎 Отследить заявку можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
         "Менеджер проверит товар, стоимость, комиссию и доставку.",
-        reply_markup=client_keyboard(),
+        reply_markup=track_button(order['tracking_code']),
     )
+    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -2855,10 +2890,13 @@ async def wholesale_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на оптовую доставку создана.\nНомер: <b>{safe(order['tracking_code'])}</b>\n\n"
+        f"✅ Заявка на оптовую доставку создана.\n"
+        f"Номер: <b>{safe(order['tracking_code'])}</b>\n\n"
+        f"🔎 Отследить заявку можно по ссылке:\n{safe(track_url(order['tracking_code']))}\n\n"
         "Менеджер проверит маршрут, документы, тариф и условия.",
-        reply_markup=client_keyboard(),
+        reply_markup=track_button(order['tracking_code']),
     )
+    await message.answer("Главное меню ниже 👇", reply_markup=client_keyboard())
     await show_order_to_admin(bot, order)
 
 
@@ -3157,7 +3195,7 @@ async def qr_finish(message: Message, state: FSMContext, bot: Bot):
         await message.answer("⛔ QR можно получить только по своему грузу.", reply_markup=client_keyboard())
         return
     me = await bot.get_me()
-    payload = f"https://t.me/{me.username}?start=track_{order['tracking_code']}"
+    payload = track_url(order['tracking_code'])
     await message.answer_photo(BufferedInputFile(make_qr_bytes(payload), filename=f"{order['tracking_code']}.png"), caption=f"🔳 QR для {safe(order['tracking_code'])}", reply_markup=client_keyboard())
 
 
@@ -3454,7 +3492,7 @@ async def status_manual_finish(message: Message, state: FSMContext, bot: Bot):
     await notify_user(
         bot,
         updated["user_id"],
-        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(updated['status'])}</b>\n{safe(comment)}",
+        f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(updated['status'])}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
     )
 
 
@@ -3800,7 +3838,7 @@ async def cb_batch_set_status(call: CallbackQuery, bot: Bot):
         await call.answer("Партия не найдена", show_alert=True)
         return
     for order in orders:
-        await notify_user(bot, order["user_id"], f"📦 Статус груза <b>{safe(order['tracking_code'])}</b> обновлён по партии: <b>{safe(status)}</b>")
+        await notify_user(bot, order["user_id"], f"📦 Статус груза <b>{safe(order['tracking_code'])}</b> обновлён по партии: <b>{safe(status)}</b>\n\n🔎 Отследить: {safe(track_url(order['tracking_code']))}")
         await asyncio.sleep(0.04)
     await call.message.answer(f"✅ Статус партии #{batch_id} изменён на <b>{safe(status)}</b>.\nУведомлено грузов: {len(orders)}")
     await call.answer("Готово")
@@ -4362,7 +4400,7 @@ async def process_auto_statuses(bot: Bot) -> int:
             await notify_user(
                 bot,
                 updated["user_id"],
-                f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}",
+                f"📦 Статус груза <b>{safe(updated['tracking_code'])}</b> обновлён: <b>{safe(status)}</b>\n{safe(comment)}\n\n🔎 Отследить: {safe(track_url(updated['tracking_code']))}",
             )
         except Exception as e:
             logger.exception("Auto status failed for order %s: %s", order["id"], e)
