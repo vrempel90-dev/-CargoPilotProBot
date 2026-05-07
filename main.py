@@ -81,6 +81,38 @@ TRUSTFLOW_ENABLED = os.getenv("TRUSTFLOW_ENABLED", "true").strip().lower() in {"
 TRUSTFLOW_GRACE_HOURS = int(os.getenv("TRUSTFLOW_GRACE_HOURS", "12"))
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "CargoPilotProBot").strip().lstrip("@")
 
+# Demo Bank Payments: виртуальные банки для показа клиенту.
+# Это НЕ реальная оплата и НЕ списывает деньги.
+DEMO_PAYMENT_ENABLED = os.getenv("DEMO_PAYMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+DEMO_PAYMENT_AMOUNT = float(os.getenv("DEMO_PAYMENT_AMOUNT", "10000"))
+
+DEMO_PAYMENT_PROVIDERS = {
+    "kaspi": {
+        "title": "Kaspi Pay Demo",
+        "label": "Kaspi",
+        "subtitle": "Оплата через Kaspi QR / Kaspi Pay",
+        "color": "#e31e24",
+    },
+    "halyk": {
+        "title": "Halyk Bank Demo",
+        "label": "Halyk",
+        "subtitle": "Оплата картой / Halyk QR",
+        "color": "#00a651",
+    },
+    "bcc": {
+        "title": "ЦентрКредит Demo",
+        "label": "BCC",
+        "subtitle": "Оплата через Bank CenterCredit",
+        "color": "#0060a9",
+    },
+    "freedom": {
+        "title": "Freedom Bank Demo",
+        "label": "Freedom",
+        "subtitle": "Оплата через Freedom Bank",
+        "color": "#ffb000",
+    },
+}
+
 # Бесплатные автостатусы: бот сам меняет статус по срокам маршрута.
 # Не требует WhatsApp API, OpenAI, Gemini, Kaspi API или других платных сервисов.
 AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -310,6 +342,21 @@ def track_button(code: str) -> InlineKeyboardMarkup:
     )
 
 
+def payment_page_url(code: str) -> str:
+    return f"{PUBLIC_BASE_URL}/demo-pay/{str(code).strip().upper()}"
+
+
+def track_pay_button(code: str, debt: float = 0) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="🔎 Отследить груз", url=track_url(code))]]
+    if DEMO_PAYMENT_ENABLED and debt > 0:
+        buttons.append([InlineKeyboardButton(text="💳 Оплатить", url=payment_page_url(code))])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def provider_info(provider: str) -> dict:
+    return DEMO_PAYMENT_PROVIDERS.get((provider or "").strip().lower(), DEMO_PAYMENT_PROVIDERS["kaspi"])
+
+
 def status_notify_text(code: str, status: str, comment: str = "") -> str:
     text = (
         f"📦 Статус груза <b>{safe(code)}</b> обновлён.\n"
@@ -326,7 +373,7 @@ def client_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="📦 Оформить доставку"), KeyboardButton(text="🔎 Где мой груз?")],
             [KeyboardButton(text="🧮 Рассчитать доставку"), KeyboardButton(text="🛒 Выкуп товара")],
             [KeyboardButton(text="🏢 Оптовая доставка"), KeyboardButton(text="⚠️ Жалоба / проблема")],
-            [KeyboardButton(text="🛠️ Техподдержка")],
+            [KeyboardButton(text="🛠️ Техподдержка"), KeyboardButton(text="💳 Оплатить доставку")],
             [KeyboardButton(text="👤 Мой кабинет"), KeyboardButton(text="📋 Мои заказы")],
             [KeyboardButton(text="🕓 История статусов"), KeyboardButton(text="📷 Фото груза")],
             [KeyboardButton(text="🔳 QR груза"), KeyboardButton(text="❓ FAQ")],
@@ -792,6 +839,18 @@ async def init_db() -> None:
                 ip TEXT,
                 user_agent TEXT,
                 created_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS demo_payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payment_id TEXT UNIQUE,
+                order_id INTEGER,
+                tracking_code TEXT,
+                amount REAL,
+                status TEXT DEFAULT 'created',
+                provider TEXT,
+                created_at TEXT,
+                paid_at TEXT
             );
             """
         )
@@ -1631,6 +1690,78 @@ async def add_payment(code: str, amount: float, comment: str, created_by: int) -
         )
         await db.commit()
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order["id"],))
+
+
+def demo_payment_amount_for_order(order: aiosqlite.Row) -> float:
+    price = float(order["price"] or 0)
+    paid = float(order["paid_amount"] or 0)
+    debt = max(price - paid, 0)
+    if debt <= 0:
+        return float(DEMO_PAYMENT_AMOUNT)
+    return round(debt, 2)
+
+
+async def ensure_demo_price_if_needed(order: aiosqlite.Row) -> aiosqlite.Row:
+    """Для демо ставим тестовую сумму, если цена ещё не указана менеджером."""
+    price = float(order["price"] or 0)
+    if price > 0:
+        return order
+    cost = round(float(DEMO_PAYMENT_AMOUNT) * 0.7, 2)
+    updated = await set_order_price(order["tracking_code"], float(DEMO_PAYMENT_AMOUNT), cost)
+    return updated or order
+
+
+async def create_demo_payment_request(code: str, provider: str = "kaspi") -> Optional[dict]:
+    order = await get_order_by_code(code)
+    if not order:
+        return None
+    order = await ensure_demo_price_if_needed(order)
+    provider_key = provider if provider in DEMO_PAYMENT_PROVIDERS else "kaspi"
+    amount = demo_payment_amount_for_order(order)
+    payment_id = f"DP{datetime.now().strftime('%y%m%d%H%M%S')}{order['id']}"
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO demo_payment_requests (payment_id, order_id, tracking_code, amount, status, provider, created_at)
+            VALUES (?, ?, ?, ?, 'created', ?, ?)
+            """,
+            (payment_id, order["id"], order["tracking_code"], amount, provider_key, now_iso()),
+        )
+        await db.commit()
+    return {
+        "payment_id": payment_id,
+        "order": await get_order(order["id"]),
+        "amount": amount,
+        "provider": provider_key,
+        "provider_info": provider_info(provider_key),
+        "checkout_url": f"{PUBLIC_BASE_URL}/demo-pay/{order['tracking_code']}/checkout/{provider_key}?payment_id={payment_id}",
+    }
+
+
+async def complete_demo_payment(code: str, provider: str = "kaspi", payment_id: str = "", actor_id: int = 0) -> Optional[aiosqlite.Row]:
+    order = await get_order_by_code(code)
+    if not order:
+        return None
+    order = await ensure_demo_price_if_needed(order)
+    provider_key = provider if provider in DEMO_PAYMENT_PROVIDERS else "kaspi"
+    amount = demo_payment_amount_for_order(order)
+    updated = await add_payment(order["tracking_code"], amount, f"Виртуальная демо-оплата: {provider_info(provider_key)['label']} · {payment_id or 'без payment_id'}", actor_id)
+    async with get_db() as db:
+        if payment_id:
+            await db.execute(
+                "UPDATE demo_payment_requests SET status='paid', paid_at=? WHERE payment_id=?",
+                (now_iso(), payment_id),
+            )
+        else:
+            await db.execute(
+                """
+                INSERT INTO demo_payment_requests (payment_id, order_id, tracking_code, amount, status, provider, created_at, paid_at)
+                VALUES (?, ?, ?, ?, 'paid', ?, ?, ?)
+                """,
+                (f"DP{datetime.now().strftime('%y%m%d%H%M%S')}{order['id']}", order["id"], order["tracking_code"], amount, provider_key, now_iso(), now_iso()),
+            )
+        await db.commit()
+    return updated
 
 
 async def list_debts(limit: int = 30) -> list[aiosqlite.Row]:
@@ -3036,7 +3167,38 @@ async def track_finish(message: Message, state: FSMContext):
     if not order:
         await message.answer("Груз не найден. Проверьте номер или напишите менеджеру.", reply_markup=client_keyboard())
         return
-    await message.answer(format_order(order), reply_markup=track_button(order['tracking_code']))
+    debt = max(float(order["price"] or 0) - float(order["paid_amount"] or 0), 0)
+    await message.answer(format_order(order), reply_markup=track_pay_button(order['tracking_code'], debt))
+
+
+@router.message(F.text == "💳 Оплатить доставку")
+async def payment_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(PaymentForm.code)
+    await message.answer("Введите номер груза для оплаты. Например: CG26050300001")
+
+
+@router.message(PaymentForm.code)
+async def payment_finish(message: Message, state: FSMContext):
+    code = parse_tracking_code(message.text or "") or (message.text or "").strip().upper()
+    await state.clear()
+    order = await get_order_by_code(code)
+    if not order:
+        await message.answer("Груз не найден. Проверьте номер или напишите менеджеру.", reply_markup=client_keyboard())
+        return
+    order = await ensure_demo_price_if_needed(order)
+    amount = demo_payment_amount_for_order(order)
+    await message.answer(
+        f"<b>💳 Оплата доставки</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Сумма к оплате: <b>{amount:g} {safe(CURRENCY)}</b>\n\n"
+        "Для демо доступны виртуальные варианты: Kaspi, Halyk, ЦентрКредит и Freedom. "
+        "Реальные деньги не списываются.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Выбрать способ оплаты", url=payment_page_url(order["tracking_code"]))],
+            [InlineKeyboardButton(text="🔎 Отследить груз", url=track_url(order["tracking_code"]))],
+        ]),
+    )
 
 
 @router.message(F.text == "📋 Мои заказы")
@@ -4828,6 +4990,14 @@ def _track_layout(title: str, content: str) -> str:
     .trust.red {{ background:#fff1f1; border-color:#ffc4c4; }}
     .trust-title {{ font-size:21px; font-weight:800; margin-bottom:8px; }}
     .trust-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }}
+    .paybox {{ margin-top:16px; padding:18px; border-radius:20px; background:#f7fbff; border:1px solid #d8edf7; }}
+    .pay-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }}
+    .pay-link {{ display:inline-block; padding:14px 16px; border-radius:14px; background:linear-gradient(135deg,var(--blue),var(--cyan)); color:white; font-weight:700; }}
+    .pay-secondary {{ display:inline-block; padding:14px 16px; border-radius:14px; background:#eef2f7; color:#0f2744; font-weight:700; }}
+    .bank-grid {{ display:grid; grid-template-columns:repeat(2, 1fr); gap:12px; margin-top:16px; }}
+    .bank-card {{ display:block; padding:18px; border-radius:18px; color:white; font-weight:800; min-height:100px; box-shadow:0 10px 30px rgba(0,0,0,.14); }}
+    .bank-card span {{ display:block; font-weight:400; opacity:.92; margin-top:6px; font-size:14px; }}
+    @media (max-width:640px) {{ .bank-grid {{ grid-template-columns:1fr; }} }}
     .hrow {{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid #f0f3f7; }}
     .dot {{ width:10px; height:10px; border-radius:50%; background:var(--blue); margin-top:5px; flex:0 0 auto; }}
     .hdate {{ color:var(--muted); font-size:13px; min-width:132px; }}
@@ -4945,6 +5115,10 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
     if trust["show_support"]:
         support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Проверить у менеджера</a>'
 
+    payment_button = ""
+    if DEMO_PAYMENT_ENABLED and debt > 0:
+        payment_button = f'<a class="pay-link" href="/demo-pay/{html.escape(order["tracking_code"])}">💳 Оплатить</a>'
+
     trust_html = f"""
       <div class="trust {html.escape(trust['level'])}">
         <div class="trust-title">{'🟢' if trust['level']=='green' else '🟡' if trust['level']=='yellow' else '🔴'} {html.escape(trust['label'])}</div>
@@ -4954,7 +5128,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
           <div class="item"><div class="label">Ожидаем обновление</div><div class="value">{html.escape(trust['next_due_text'] or 'по обработке')}</div></div>
         </div>
         <div class="hint" style="margin-top:12px;">{html.escape(trust['client_hint'])}</div>
-        {support_button}
+        <div class="pay-actions">{payment_button}{support_button}</div>
       </div>
     """
 
@@ -5023,6 +5197,146 @@ async def api_track_order(request: web.Request) -> web.Response:
     })
 
 
+def bank_provider_cards(code: str) -> str:
+    cards = []
+    for key, info in DEMO_PAYMENT_PROVIDERS.items():
+        cards.append(
+            f'<a class="bank-card" style="background:{html.escape(info["color"])}" href="/demo-pay/{html.escape(code)}/checkout/{html.escape(key)}">'
+            f'{html.escape(info["label"])}<span>{html.escape(info["subtitle"])}</span></a>'
+        )
+    return "".join(cards)
+
+
+async def demo_payment_page(request: web.Request) -> web.Response:
+    if not DEMO_PAYMENT_ENABLED:
+        return _web_response(_track_layout("Демо-оплата отключена", '<div class="error">Демо-оплата отключена.</div>'), status=403)
+    code = (request.match_info.get("code") or "").strip().upper()
+    order = await get_order_by_code(code)
+    if not order:
+        return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
+    order = await ensure_demo_price_if_needed(order)
+    amount = demo_payment_amount_for_order(order)
+    content = f"""
+      <h2 style="margin:0 0 8px;">💳 Выберите способ оплаты</h2>
+      <div class="hint">Демо-режим: реальные деньги не списываются. Это имитация банковской оплаты для показа клиенту.</div>
+      <div class="paybox">
+        <div class="grid">
+          <div class="item"><div class="label">Груз</div><div class="value">{html.escape(order['tracking_code'])}</div></div>
+          <div class="item"><div class="label">Сумма</div><div class="value">{amount:g} {html.escape(CURRENCY)}</div></div>
+        </div>
+        <div class="bank-grid">{bank_provider_cards(order['tracking_code'])}</div>
+      </div>
+      <div class="hint">В реальном внедрении эти кнопки можно заменить на настоящие Kaspi Pay, Halyk, ЦентрКредит, Freedom или другой эквайринг.</div>
+    """
+    return _web_response(_track_layout("Выбор оплаты", content))
+
+
+async def demo_payment_checkout_page(request: web.Request) -> web.Response:
+    if not DEMO_PAYMENT_ENABLED:
+        return _web_response(_track_layout("Демо-оплата отключена", '<div class="error">Демо-оплата отключена.</div>'), status=403)
+    code = (request.match_info.get("code") or "").strip().upper()
+    provider = (request.match_info.get("provider") or "kaspi").strip().lower()
+    order = await get_order_by_code(code)
+    if not order:
+        return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
+    order = await ensure_demo_price_if_needed(order)
+    payment = await create_demo_payment_request(order["tracking_code"], provider)
+    if not payment:
+        return _web_response(_track_layout("Ошибка оплаты", '<div class="error">Не удалось создать демо-оплату.</div>'), status=500)
+    info = payment["provider_info"]
+    amount = payment["amount"]
+    payment_id = html.escape(payment["payment_id"])
+    content = f"""
+      <h2 style="margin:0 0 8px;">💳 {html.escape(info['title'])}</h2>
+      <div class="hint">{html.escape(info['subtitle'])}. Демо-режим, реальные деньги не списываются.</div>
+      <div class="paybox" style="border-color:{html.escape(info['color'])};">
+        <div class="grid">
+          <div class="item"><div class="label">Груз</div><div class="value">{html.escape(order['tracking_code'])}</div></div>
+          <div class="item"><div class="label">Сумма</div><div class="value">{amount:g} {html.escape(CURRENCY)}</div></div>
+          <div class="item"><div class="label">Платёж ID</div><div class="value">{payment_id}</div></div>
+          <div class="item"><div class="label">Банк</div><div class="value">{html.escape(info['label'])}</div></div>
+        </div>
+        <div class="pay-actions">
+          <a class="pay-link" style="background:{html.escape(info['color'])};" href="/demo-pay/{html.escape(order['tracking_code'])}/success/{html.escape(payment['provider'])}?payment_id={payment_id}">✅ Оплатить в демо</a>
+          <a class="pay-secondary" href="/demo-pay/{html.escape(order['tracking_code'])}">↩️ Выбрать другой банк</a>
+          <a class="pay-secondary" href="/track/{html.escape(order['tracking_code'])}">🔎 Вернуться к грузу</a>
+        </div>
+      </div>
+      <div class="hint">В реальной версии сюда подключается официальный платёжный провайдер выбранного банка.</div>
+    """
+    return _web_response(_track_layout(f"Оплата {info['label']}", content))
+
+
+async def demo_payment_success_page(request: web.Request) -> web.Response:
+    if not DEMO_PAYMENT_ENABLED:
+        return _web_response(_track_layout("Демо-оплата отключена", '<div class="error">Демо-оплата отключена.</div>'), status=403)
+    code = (request.match_info.get("code") or "").strip().upper()
+    provider = (request.match_info.get("provider") or "kaspi").strip().lower()
+    payment_id = (request.query.get("payment_id") or "").strip()
+    updated = await complete_demo_payment(code, provider, payment_id, 0)
+    if not updated:
+        return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
+    info = provider_info(provider)
+    content = f"""
+      <h2 style="margin:0 0 8px;">✅ Оплата прошла</h2>
+      <div class="hint">Это виртуальная демо-оплата через {html.escape(info['label'])}. В реальной версии платёж подтверждает банк.</div>
+      <div class="paybox" style="border-color:{html.escape(info['color'])};">
+        <div class="grid">
+          <div class="item"><div class="label">Груз</div><div class="value">{html.escape(updated['tracking_code'])}</div></div>
+          <div class="item"><div class="label">Статус оплаты</div><div class="value">{html.escape(updated['payment_status'] or 'оплачено')}</div></div>
+          <div class="item"><div class="label">Оплачено</div><div class="value">{html.escape(str(updated['paid_amount'] or 0))} {html.escape(CURRENCY)}</div></div>
+          <div class="item"><div class="label">Банк</div><div class="value">{html.escape(info['label'])}</div></div>
+        </div>
+        <div class="pay-actions">
+          <a class="pay-link" href="/track/{html.escape(updated['tracking_code'])}">🔎 Посмотреть груз</a>
+        </div>
+      </div>
+    """
+    return _web_response(_track_layout("Оплата успешна", content))
+
+
+async def api_demo_payment_create(request: web.Request) -> web.Response:
+    code = (request.match_info.get("code") or "").strip().upper()
+    provider = (request.match_info.get("provider") or request.query.get("provider") or "kaspi").strip().lower()
+    if not DEMO_PAYMENT_ENABLED:
+        return web.json_response({"ok": False, "error": "demo_payment_disabled"}, status=403)
+    payment = await create_demo_payment_request(code, provider)
+    if not payment:
+        return web.json_response({"ok": False, "error": "order_not_found"}, status=404)
+    return web.json_response({
+        "ok": True,
+        "mode": "demo",
+        "payment_id": payment["payment_id"],
+        "tracking_code": payment["order"]["tracking_code"],
+        "amount": payment["amount"],
+        "currency": CURRENCY,
+        "provider": payment["provider"],
+        "provider_label": payment["provider_info"]["label"],
+        "checkout_url": payment["checkout_url"],
+    })
+
+
+async def api_demo_payment_success(request: web.Request) -> web.Response:
+    code = (request.match_info.get("code") or "").strip().upper()
+    provider = (request.match_info.get("provider") or request.query.get("provider") or "kaspi").strip().lower()
+    payment_id = (request.query.get("payment_id") or "").strip()
+    if not DEMO_PAYMENT_ENABLED:
+        return web.json_response({"ok": False, "error": "demo_payment_disabled"}, status=403)
+    updated = await complete_demo_payment(code, provider, payment_id, 0)
+    if not updated:
+        return web.json_response({"ok": False, "error": "order_not_found"}, status=404)
+    return web.json_response({
+        "ok": True,
+        "mode": "demo",
+        "tracking_code": updated["tracking_code"],
+        "payment_status": updated["payment_status"],
+        "paid_amount": updated["paid_amount"],
+        "currency": CURRENCY,
+        "provider": provider,
+        "provider_label": provider_info(provider)["label"],
+    })
+
+
 # =========================
 # HEALTH SERVER
 # =========================
@@ -5038,6 +5352,13 @@ async def start_health_server(bot: Bot) -> None:
     app.router.add_get("/track", track_page)
     app.router.add_get("/track/{code}", track_code_page)
     app.router.add_get("/api/track/{code}", api_track_order)
+    app.router.add_get("/demo-pay/{code}", demo_payment_page)
+    app.router.add_get("/demo-pay/{code}/checkout/{provider}", demo_payment_checkout_page)
+    app.router.add_get("/demo-pay/{code}/success/{provider}", demo_payment_success_page)
+    app.router.add_get("/api/demo-payment/create/{code}", api_demo_payment_create)
+    app.router.add_get("/api/demo-payment/create/{provider}/{code}", api_demo_payment_create)
+    app.router.add_get("/api/demo-payment/success/{code}", api_demo_payment_success)
+    app.router.add_get("/api/demo-payment/success/{provider}/{code}", api_demo_payment_success)
     app.router.add_get("/health", health)
     runner = web.AppRunner(app)
     await runner.setup()
