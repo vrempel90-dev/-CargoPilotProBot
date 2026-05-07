@@ -86,6 +86,8 @@ PROMISE_OS_ENABLED = os.getenv("PROMISE_OS_ENABLED", "true").strip().lower() in 
 PROMISE_STALE_HOURS = int(os.getenv("PROMISE_STALE_HOURS", "24"))
 PROMISE_HIGH_TRACK_VIEWS = int(os.getenv("PROMISE_HIGH_TRACK_VIEWS", "5"))
 
+PROMISE_LOCK_ENABLED = os.getenv("PROMISE_LOCK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
 # Demo Bank Payments: виртуальные банки для показа клиенту.
 # Это НЕ реальная оплата и НЕ списывает деньги.
 DEMO_PAYMENT_ENABLED = os.getenv("DEMO_PAYMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -394,17 +396,18 @@ def client_keyboard() -> ReplyKeyboardMarkup:
 def admin_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🧭 Promise OS"), KeyboardButton(text="📥 Новые заявки")],
-            [KeyboardButton(text="📦 Все грузы"), KeyboardButton(text="🔎 Найти груз")],
-            [KeyboardButton(text="💳 Оплаты/долги"), KeyboardButton(text="🤖 Автостатусы")],
-            [KeyboardButton(text="📦 Партии"), KeyboardButton(text="🚨 Проблемные грузы")],
-            [KeyboardButton(text="🔁 Изменить статус"), KeyboardButton(text="🏭 Меню склада")],
-            [KeyboardButton(text="🛠️ Техподдержка"), KeyboardButton(text="💬 Жалобы")],
-            [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
-            [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="⚙️ Статусы")],
-            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="👥 Роли")],
-            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="👤 Клиентское меню")],
+            [KeyboardButton(text="🧭 Promise OS"), KeyboardButton(text="🔐 Promise Lock")],
+            [KeyboardButton(text="📥 Новые заявки"), KeyboardButton(text="📦 Все грузы")],
+            [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="💳 Оплаты/долги")],
+            [KeyboardButton(text="🤖 Автостатусы"), KeyboardButton(text="📦 Партии")],
+            [KeyboardButton(text="🚨 Проблемные грузы"), KeyboardButton(text="🔁 Изменить статус")],
+            [KeyboardButton(text="🏭 Меню склада"), KeyboardButton(text="🛠️ Техподдержка")],
+            [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="👥 Клиенты")],
+            [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="📤 Excel экспорт")],
+            [KeyboardButton(text="📥 Обновить из Excel"), KeyboardButton(text="⚙️ Тарифы")],
+            [KeyboardButton(text="⚙️ Статусы"), KeyboardButton(text="📄 PDF квитанция")],
+            [KeyboardButton(text="👥 Роли"), KeyboardButton(text="📊 Отчёт за день")],
+            [KeyboardButton(text="👤 Клиентское меню")],
         ],
         resize_keyboard=True,
         input_field_placeholder="CargoPromise OS: выберите действие",
@@ -1116,6 +1119,80 @@ async def track_view_stats(code: Optional[str] = None) -> dict:
     return {"total": total["cnt"] if total else 0, "today": today_row["cnt"] if today_row else 0}
 
 
+def promise_id(order: aiosqlite.Row) -> str:
+    """Promise ID = цифровое обещание по грузу.
+
+    Это отдельный идентификатор методики CargoPromise, не просто трек-номер.
+    """
+    raw_date = (order["created_at"] or now_iso())[:10].replace("-", "")
+    short_date = raw_date[2:] if len(raw_date) >= 8 else datetime.now().strftime("%y%m%d")
+    return f"CP-{short_date}-{int(order['id']):05d}"
+
+
+def parse_window_days(window: str) -> tuple[int, int]:
+    nums = [int(x) for x in re.findall(r"\d+", window or "")]
+    if not nums:
+        return 0, 0
+    if len(nums) == 1:
+        return nums[0], nums[0]
+    return nums[0], nums[1]
+
+
+def promise_lock_assessment(order: aiosqlite.Row, promised_days: int) -> dict:
+    """Promise Lock не даёт менеджеру обещать опасный срок."""
+    safe_window, start_rule, warning = promise_route_window(order)
+    min_days, max_days = parse_window_days(safe_window)
+    risky = bool(max_days and promised_days < min_days)
+    too_long = bool(max_days and promised_days > max_days + 7)
+
+    if risky:
+        level = "red"
+        title = "⚠️ Рискованное обещание"
+        reason = f"Для этого маршрута безопаснее обещать {safe_window}, а не {promised_days} дней."
+        allowed = False
+    elif too_long:
+        level = "yellow"
+        title = "🟡 Срок слишком широкий"
+        reason = f"Можно обещать короче: безопасная рамка {safe_window}."
+        allowed = True
+    else:
+        level = "green"
+        title = "✅ Обещание безопасно"
+        reason = f"Срок {promised_days} дней не конфликтует с безопасной рамкой {safe_window}."
+        allowed = True
+
+    client_phrase = (
+        f"Ориентировочный срок доставки: {safe_window}. "
+        f"Срок считается {start_rule}. "
+        f"{warning}"
+    )
+
+    return {
+        "allowed": allowed,
+        "level": level,
+        "title": title,
+        "reason": reason,
+        "safe_window": safe_window,
+        "start_rule": start_rule,
+        "warning": warning,
+        "client_phrase": client_phrase,
+        "promised_days": promised_days,
+    }
+
+
+def format_promise_lock_result(order: aiosqlite.Row, result: dict) -> str:
+    return (
+        f"<b>🔐 Promise Lock</b>\n\n"
+        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Маршрут: {safe(order['from_country'] or '—')} → {safe(order['to_city'] or '—')}\n\n"
+        f"{safe(result['title'])}\n"
+        f"{safe(result['reason'])}\n\n"
+        f"<b>Что лучше писать клиенту:</b>\n"
+        f"{safe(result['client_phrase'])}"
+    )
+
+
 def promise_route_window(order: aiosqlite.Row) -> tuple[str, str, str]:
     route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
     if route_key == "china_cis":
@@ -1218,6 +1295,8 @@ def promise_os_profile(order: aiosqlite.Row, history: list[aiosqlite.Row], photo
         proof_points.append("доказательства ещё собираются")
 
     return {
+        "promise_id": promise_id(order),
+        "method": "CargoPromise Trust Method",
         "score": score,
         "anxiety": anxiety,
         "gate": gate,
@@ -1240,8 +1319,9 @@ def promise_os_html(order: aiosqlite.Row, profile: dict) -> str:
       <div class="promise {html.escape(profile['level'])}">
         <div class="promise-head">
           <div>
-            <div class="promise-kicker">CargoPromise OS</div>
+            <div class="promise-kicker">CargoPromise Trust Method</div>
             <div class="promise-title">{emoji} {html.escape(profile['client_label'])}</div>
+            <div class="hint">Promise ID: <b>{html.escape(profile['promise_id'])}</b></div>
           </div>
           <div class="score">{profile['score']}<span>/100</span></div>
         </div>
@@ -1253,11 +1333,11 @@ def promise_os_html(order: aiosqlite.Row, profile: dict) -> str:
         </div>
         <div class="promise-two">
           <div>
-            <b>Риски обещания</b>
+            <b>Promise Lock: риски обещания</b>
             <ul>{risks}</ul>
           </div>
           <div>
-            <b>Доказательства по грузу</b>
+            <b>Proof Passport: доказательства</b>
             <ul>{proofs}</ul>
           </div>
         </div>
@@ -1304,9 +1384,9 @@ def format_promise_os_report(data: dict) -> str:
     radar = data["radar"]
     top = data["top_profiles"]
     lines = [
-        "<b>🧭 CargoPromise OS</b>",
+        "<b>🧭 CargoPromise OS · Promise Control System</b>",
         "",
-        "Карта обещаний, рисков и потерь по грузам.",
+        "Карта обещаний, тревожности клиентов, рисков спора и потерь по грузам.",
         "",
         f"Самопроверок трекера сегодня: <b>{data['views']['today']}</b>",
         f"Долг / риск неоплаты: <b>{data['debt']:g} {safe(CURRENCY)}</b>",
@@ -1323,7 +1403,7 @@ def format_promise_os_report(data: dict) -> str:
         for order, p in top[:8]:
             lines.append(f"— <b>{safe(order['tracking_code'])}</b>: TrustScore {p['score']}/100, Anxiety {p['anxiety']}/100 · {safe(p['gate'])}")
     lines.append("")
-    lines.append("Смысл: не ждать жалоб, а видеть риск до того, как клиент напишет «где мой груз?»")
+    lines.append("Смысл: контролировать обещания до того, как они превратятся в спор, возврат или потерю клиента.")
     return "\n".join(lines)
 
 
@@ -1795,7 +1875,7 @@ async def create_order(
             (
                 order_id,
                 "новая заявка",
-                "Заявка создана клиентом. Автостатусы ждут оплаты и включения админом.",
+                f"Заявка создана клиентом. Promise ID: CP-{datetime.now().strftime('%y%m%d')}-{order_id:05d}. Автостатусы ждут оплаты и включения админом.",
                 user_id,
                 now_iso(),
             ),
@@ -2554,6 +2634,10 @@ class CalcForm(StatesGroup):
 
 class TrackForm(StatesGroup):
     code = State()
+
+
+class PromiseLockForm(StatesGroup):
+    text = State()
 
 
 class BuyoutForm(StatesGroup):
@@ -4325,6 +4409,50 @@ async def admin_smartflow_report(message: Message):
     await message.answer(await owner_smartflow_report_text(), reply_markup=admin_keyboard())
 
 
+@router.message(F.text == "🔐 Promise Lock")
+async def promise_lock_start(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await state.set_state(PromiseLockForm.text)
+    await message.answer(
+        "<b>🔐 Promise Lock</b>\n\n"
+        "Проверьте, можно ли обещать клиенту конкретный срок.\n\n"
+        "Формат:\n"
+        "<code>CG26050700001 7</code>\n\n"
+        "Где 7 — сколько дней менеджер хочет обещать клиенту.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+@router.message(PromiseLockForm.text)
+async def promise_lock_finish(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    parts = text.split()
+    if len(parts) < 2:
+        await message.answer("Введите так: <code>CG26050700001 7</code>", reply_markup=admin_keyboard())
+        return
+
+    code = parse_tracking_code(parts[0]) or parts[0].upper()
+    days_match = re.search(r"\d+", " ".join(parts[1:]))
+    if not days_match:
+        await message.answer("Не увидел срок в днях. Пример: <code>CG26050700001 7</code>", reply_markup=admin_keyboard())
+        return
+
+    order = await get_order_by_code(code)
+    if not order:
+        await message.answer("Груз не найден.", reply_markup=admin_keyboard())
+        return
+
+    promised_days = int(days_match.group(0))
+    result = promise_lock_assessment(order, promised_days)
+    await state.clear()
+    await message.answer(format_promise_lock_result(order, result), reply_markup=admin_keyboard())
+
+
+
 @router.message(F.text == "🧭 Promise OS")
 @router.message(F.text == "📊 SmartFlow отчёт")
 async def admin_promise_os(message: Message):
@@ -5360,7 +5488,7 @@ def _track_layout(title: str, content: str) -> str:
     <div class="shell">
       <div class="hero">
         <h1>{company}</h1>
-        <p>CargoPromise OS: обещания, риски и доказательная история груза</p>
+        <p>CargoPromise OS: Promise ID, Promise Lock, Anxiety Radar и Proof Passport</p>
       </div>
       <div class="card">{content}</div>
       <div class="footer">CargoPromise OS · контроль обещаний и рисков в карго</div>
@@ -5466,13 +5594,13 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
 
     promise_summary = f"""
       <div class="smart">
-        <h3>Promise Card</h3>
-        <div class="hint">Это не просто трекер. Это карточка обещания: что можно обещать клиенту, где есть риск и какие доказательства уже есть.</div>
+        <h3>Promise Control Card</h3>
+        <div class="hint">Это не просто трекер. Это цифровой паспорт обещания: что можно обещать, где риск спора и какие доказательства уже собраны.</div>
         <div class="grid" style="margin-top:12px;">
           <div class="item"><div class="label">Обращения</div><div class="value">{html.escape(support_status)}</div></div>
           <div class="item"><div class="label">Просмотров ссылки</div><div class="value">{views['total']}</div></div>
           <div class="item"><div class="label">Risk Gate</div><div class="value">{html.escape(promise['gate'])}</div></div>
-          <div class="item"><div class="label">Dispute Shield</div><div class="value">история зафиксирована</div></div>
+          <div class="item"><div class="label">Proof Passport</div><div class="value">история зафиксирована</div></div>
         </div>
       </div>
     """
@@ -5516,6 +5644,7 @@ async def api_track_order(request: web.Request) -> web.Response:
         "product": "CargoPromise OS",
         "tracking_code": order["tracking_code"],
         "status": order["status"],
+        "promise_id": promise.get("promise_id"),
         "promise": promise,
         "trustflow": trust,
         "from_country": order["from_country"],
