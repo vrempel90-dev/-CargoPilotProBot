@@ -1738,14 +1738,43 @@ async def create_demo_payment_request(code: str, provider: str = "kaspi") -> Opt
     }
 
 
-async def complete_demo_payment(code: str, provider: str = "kaspi", payment_id: str = "", actor_id: int = 0) -> Optional[aiosqlite.Row]:
+async def complete_demo_payment(code: str, provider: str = "kaspi", payment_id: str = "", actor_id: int = 0) -> Optional[dict]:
     order = await get_order_by_code(code)
     if not order:
         return None
     order = await ensure_demo_price_if_needed(order)
     provider_key = provider if provider in DEMO_PAYMENT_PROVIDERS else "kaspi"
+
+    async with get_db() as db:
+        existing_payment = None
+        if payment_id:
+            existing_payment = await db_fetchone(
+                db,
+                "SELECT status, amount FROM demo_payment_requests WHERE payment_id=?",
+                (payment_id,),
+            )
+
+    # Защита от двойного клика: если payment_id уже paid, второй раз оплату не добавляем.
+    if existing_payment and existing_payment["status"] == "paid":
+        current = await get_order_by_code(code)
+        return {
+            "order": current,
+            "amount": float(existing_payment["amount"] or 0),
+            "provider": provider_key,
+            "payment_id": payment_id,
+            "already_paid": True,
+        }
+
     amount = demo_payment_amount_for_order(order)
-    updated = await add_payment(order["tracking_code"], amount, f"Виртуальная демо-оплата: {provider_info(provider_key)['label']} · {payment_id or 'без payment_id'}", actor_id)
+    updated = await add_payment(
+        order["tracking_code"],
+        amount,
+        f"Виртуальная демо-оплата: {provider_info(provider_key)['label']} · {payment_id or 'без payment_id'}",
+        actor_id,
+    )
+    if not updated:
+        return None
+
     async with get_db() as db:
         if payment_id:
             await db.execute(
@@ -1753,15 +1782,23 @@ async def complete_demo_payment(code: str, provider: str = "kaspi", payment_id: 
                 (now_iso(), payment_id),
             )
         else:
+            payment_id = f"DP{datetime.now().strftime('%y%m%d%H%M%S')}{order['id']}"
             await db.execute(
                 """
                 INSERT INTO demo_payment_requests (payment_id, order_id, tracking_code, amount, status, provider, created_at, paid_at)
                 VALUES (?, ?, ?, ?, 'paid', ?, ?, ?)
                 """,
-                (f"DP{datetime.now().strftime('%y%m%d%H%M%S')}{order['id']}", order["id"], order["tracking_code"], amount, provider_key, now_iso(), now_iso()),
+                (payment_id, order["id"], order["tracking_code"], amount, provider_key, now_iso(), now_iso()),
             )
         await db.commit()
-    return updated
+
+    return {
+        "order": updated,
+        "amount": amount,
+        "provider": provider_key,
+        "payment_id": payment_id,
+        "already_paid": False,
+    }
 
 
 async def list_debts(limit: int = 30) -> list[aiosqlite.Row]:
@@ -2038,6 +2075,20 @@ async def notify_admins(bot: Bot, text: str, reply_markup: Optional[InlineKeyboa
             await bot.send_message(admin_id, text, reply_markup=reply_markup)
         except Exception as e:
             logger.warning("Failed to notify admin %s: %s", admin_id, e)
+
+
+def admin_payment_notify_text(order: aiosqlite.Row, provider: str, amount: float, payment_id: str = "") -> str:
+    info = provider_info(provider)
+    return (
+        "<b>💳 Новая оплата</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Банк: <b>{safe(info['label'])}</b>\n"
+        f"Сумма: <b>{amount:g} {safe(CURRENCY)}</b>\n"
+        f"Статус оплаты: <b>{safe(order['payment_status'] or 'оплачено')}</b>\n"
+        f"Всего оплачено: <b>{safe(str(order['paid_amount'] or 0))} {safe(CURRENCY)}</b>\n"
+        f"Payment ID: <code>{safe(payment_id or 'demo')}</code>\n\n"
+        "Это демо-оплата. В реальном внедрении уведомление будет приходить после подтверждения банка."
+    )
 
 
 async def notify_user(bot: Bot, user_id: int, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -3175,7 +3226,10 @@ async def track_finish(message: Message, state: FSMContext):
 async def payment_start(message: Message, state: FSMContext):
     await state.clear()
     await state.set_state(PaymentForm.code)
-    await message.answer("Введите номер груза для оплаты. Например: CG26050300001")
+    await message.answer(
+        "Введите номер груза для оплаты. Например: CG26050300001\n\n"
+        "Оплата открывается отдельно от страницы отслеживания."
+    )
 
 
 @router.message(PaymentForm.code)
@@ -5115,10 +5169,6 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
     if trust["show_support"]:
         support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Проверить у менеджера</a>'
 
-    payment_button = ""
-    if DEMO_PAYMENT_ENABLED and debt > 0:
-        payment_button = f'<a class="pay-link" href="/demo-pay/{html.escape(order["tracking_code"])}">💳 Оплатить</a>'
-
     trust_html = f"""
       <div class="trust {html.escape(trust['level'])}">
         <div class="trust-title">{'🟢' if trust['level']=='green' else '🟡' if trust['level']=='yellow' else '🔴'} {html.escape(trust['label'])}</div>
@@ -5128,7 +5178,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
           <div class="item"><div class="label">Ожидаем обновление</div><div class="value">{html.escape(trust['next_due_text'] or 'по обработке')}</div></div>
         </div>
         <div class="hint" style="margin-top:12px;">{html.escape(trust['client_hint'])}</div>
-        <div class="pay-actions">{payment_button}{support_button}</div>
+        <div class="pay-actions">{support_button}</div>
       </div>
     """
 
@@ -5137,7 +5187,6 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         <h3>Smart-карточка груза</h3>
         <div class="hint">Клиент видит не просто статус, а понятное объяснение, следующий этап и нужно ли писать менеджеру.</div>
         <div class="grid" style="margin-top:12px;">
-          <div class="item"><div class="label">Оплата</div><div class="value">{html.escape(payment_text)}</div></div>
           <div class="item"><div class="label">Обращения</div><div class="value">{html.escape(support_status)}</div></div>
           <div class="item"><div class="label">Просмотров ссылки</div><div class="value">{views['total']}</div></div>
           <div class="item"><div class="label">Маршрут SmartFlow</div><div class="value">{html.escape(trust['route_name'])}</div></div>
@@ -5273,10 +5322,24 @@ async def demo_payment_success_page(request: web.Request) -> web.Response:
     code = (request.match_info.get("code") or "").strip().upper()
     provider = (request.match_info.get("provider") or "kaspi").strip().lower()
     payment_id = (request.query.get("payment_id") or "").strip()
-    updated = await complete_demo_payment(code, provider, payment_id, 0)
-    if not updated:
+    payment_result = await complete_demo_payment(code, provider, payment_id, 0)
+    if not payment_result:
         return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
-    info = provider_info(provider)
+
+    updated = payment_result["order"]
+    amount = float(payment_result["amount"] or 0)
+    provider_key = payment_result["provider"]
+    info = provider_info(provider_key)
+
+    # Уведомляем админа один раз, только когда оплата впервые стала paid.
+    if not payment_result.get("already_paid"):
+        bot = request.app.get("bot")
+        if bot:
+            await notify_admins(
+                bot,
+                admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+            )
+
     content = f"""
       <h2 style="margin:0 0 8px;">✅ Оплата прошла</h2>
       <div class="hint">Это виртуальная демо-оплата через {html.escape(info['label'])}. В реальной версии платёж подтверждает банк.</div>
@@ -5322,9 +5385,22 @@ async def api_demo_payment_success(request: web.Request) -> web.Response:
     payment_id = (request.query.get("payment_id") or "").strip()
     if not DEMO_PAYMENT_ENABLED:
         return web.json_response({"ok": False, "error": "demo_payment_disabled"}, status=403)
-    updated = await complete_demo_payment(code, provider, payment_id, 0)
-    if not updated:
+    payment_result = await complete_demo_payment(code, provider, payment_id, 0)
+    if not payment_result:
         return web.json_response({"ok": False, "error": "order_not_found"}, status=404)
+
+    updated = payment_result["order"]
+    amount = float(payment_result["amount"] or 0)
+    provider_key = payment_result["provider"]
+
+    if not payment_result.get("already_paid"):
+        bot = request.app.get("bot")
+        if bot:
+            await notify_admins(
+                bot,
+                admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+            )
+
     return web.json_response({
         "ok": True,
         "mode": "demo",
@@ -5332,8 +5408,9 @@ async def api_demo_payment_success(request: web.Request) -> web.Response:
         "payment_status": updated["payment_status"],
         "paid_amount": updated["paid_amount"],
         "currency": CURRENCY,
-        "provider": provider,
-        "provider_label": provider_info(provider)["label"],
+        "provider": provider_key,
+        "provider_label": provider_info(provider_key)["label"],
+        "admin_notified": not payment_result.get("already_paid"),
     })
 
 
