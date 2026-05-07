@@ -119,8 +119,9 @@ AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() i
 AUTO_STATUS_INTERVAL_SECONDS = int(os.getenv("AUTO_STATUS_INTERVAL_SECONDS", "300"))
 # days = реальная работа, minutes = демо-режим для быстрых показов клиенту. Оба режима бесплатные.
 AUTO_STATUS_TIME_UNIT = os.getenv("AUTO_STATUS_TIME_UNIT", "days").strip().lower()
-# Если true, новые заявки сразу получают бесплатный авто-маршрут без ручного включения.
-AUTO_STATUS_ON_NEW_ORDERS = os.getenv("AUTO_STATUS_ON_NEW_ORDERS", "true").strip().lower() in {"1", "true", "yes", "on"}
+# По новой логике автостатусы НЕ включаются сразу. Сначала клиент оплачивает, потом админ включает их кнопкой.
+AUTO_STATUS_ON_NEW_ORDERS = os.getenv("AUTO_STATUS_ON_NEW_ORDERS", "false").strip().lower() in {"1", "true", "yes", "on"}
+AUTO_STATUS_AFTER_PAYMENT_ONLY = os.getenv("AUTO_STATUS_AFTER_PAYMENT_ONLY", "true").strip().lower() in {"1", "true", "yes", "on"}
 REGION_MODE = os.getenv("REGION_MODE", "CIS").strip() or "CIS"
 
 ADMIN_IDS = {
@@ -519,6 +520,20 @@ def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🤖 Включить автостатусы", callback_data=f"auto_enable:{order_id}")],
             [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="✅ Доставлен", callback_data=f"st:{order_id}:доставлен")],
+            [InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"st:{order_id}:проблема")],
+        ]
+    )
+
+
+def new_order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Кнопки для новой заявки до оплаты.
+
+    Автостатусы специально не показываем, чтобы логика была:
+    заявка → оплата → уведомление админу → админ включает автостатусы.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"st:{order_id}:проблема")],
         ]
     )
@@ -941,6 +956,19 @@ async def get_order(order_id: int) -> Optional[aiosqlite.Row]:
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
 
 
+async def order_payment_confirmed(order: aiosqlite.Row) -> bool:
+    """Можно ли включать автостатусы.
+
+    В новой логике автостатусы запускаются только после оплаты.
+    Для демо достаточно paid_amount > 0 или payment_status = оплачено/частично.
+    """
+    if not AUTO_STATUS_AFTER_PAYMENT_ONLY:
+        return True
+    paid = float(order["paid_amount"] or 0)
+    status = normalize(order["payment_status"] or "")
+    return paid > 0 or status in {"оплачено", "частично"}
+
+
 def choose_auto_route(from_country: str, to_city: str = "") -> str:
     text = normalize(f"{from_country} {to_city}")
     if any(x in text for x in ["китай", "china", "guangzhou", "гуанчжоу", "иу", "yiwu", "1688", "taobao"]):
@@ -1094,6 +1122,8 @@ async def enable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Opti
     order = await get_order(order_id)
     if not order:
         return None
+    if not await order_payment_confirmed(order):
+        return None
     route_key = choose_auto_route(order["from_country"] or "", order["to_city"] or "")
     async with get_db() as db:
         await db.execute(
@@ -1128,6 +1158,7 @@ async def enable_auto_status_for_active_orders(actor_id: int = 0, limit: int = 5
             """
             SELECT id FROM orders
             WHERE COALESCE(auto_status_enabled, 0)=0
+              AND (COALESCE(paid_amount, 0) > 0 OR payment_status IN ('оплачено', 'частично'))
               AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
             ORDER BY id DESC
             LIMIT ?
@@ -1149,6 +1180,7 @@ async def list_orders_without_auto_status(limit: int = 10) -> list[aiosqlite.Row
             """
             SELECT * FROM orders
             WHERE COALESCE(auto_status_enabled, 0)=0
+              AND (COALESCE(paid_amount, 0) > 0 OR payment_status IN ('оплачено', 'частично'))
               AND status NOT IN ('доставлен', 'отменён', 'проблема', 'передан курьеру')
             ORDER BY id DESC
             LIMIT ?
@@ -1540,22 +1572,20 @@ async def create_order(
         order_id = cur.lastrowid
         code = f"CG{datetime.now().strftime('%y%m%d')}{order_id:05d}"
         route_key = choose_auto_route(from_country, to_city)
-        created_at = now_iso()
-        auto_enabled = 1 if AUTO_STATUS_ON_NEW_ORDERS else 0
-        auto_started_at = created_at if AUTO_STATUS_ON_NEW_ORDERS else None
         await db.execute(
-            "UPDATE orders SET tracking_code=?, auto_status_route=?, auto_status_enabled=?, auto_status_started_at=? WHERE id=?",
-            (code, route_key, auto_enabled, auto_started_at, order_id),
+            "UPDATE orders SET tracking_code=?, auto_status_route=?, auto_status_enabled=0, auto_status_started_at=NULL WHERE id=?",
+            (code, route_key, order_id),
         )
         await db.execute(
             "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-            (order_id, "новая заявка", "Заявка создана клиентом", user_id, now_iso()),
+            (
+                order_id,
+                "новая заявка",
+                "Заявка создана клиентом. Автостатусы ждут оплаты и включения админом.",
+                user_id,
+                now_iso(),
+            ),
         )
-        if AUTO_STATUS_ON_NEW_ORDERS:
-            await db.execute(
-                "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
-                (order_id, "новая заявка", f"Автостатусы включены автоматически. Маршрут: {auto_route_label(route_key)}", 0, now_iso()),
-            )
         await db.commit()
         return await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
 
@@ -2087,7 +2117,7 @@ def admin_payment_notify_text(order: aiosqlite.Row, provider: str, amount: float
         f"Статус оплаты: <b>{safe(order['payment_status'] or 'оплачено')}</b>\n"
         f"Всего оплачено: <b>{safe(str(order['paid_amount'] or 0))} {safe(CURRENCY)}</b>\n"
         f"Payment ID: <code>{safe(payment_id or 'demo')}</code>\n\n"
-        "Это демо-оплата. В реальном внедрении уведомление будет приходить после подтверждения банка."
+        "Клиент оплатил груз. Теперь можно включить автостатусы одной кнопкой."
     )
 
 
@@ -2154,7 +2184,7 @@ def format_short_order(order: aiosqlite.Row) -> str:
 
 async def show_order_to_admin(bot: Bot, order: aiosqlite.Row) -> None:
     text = "<b>🆕 Новая заявка</b>\n\n" + format_order(order)
-    await notify_admins(bot, text, order_actions_keyboard(order["id"]))
+    await notify_admins(bot, text, new_order_actions_keyboard(order["id"]))
 
 
 def format_history(rows: list[aiosqlite.Row]) -> str:
@@ -2607,6 +2637,13 @@ async def cmd_autostatus(message: Message):
         await message.answer("Груз не найден.")
         return
     if parts[2].lower() in {"on", "вкл"}:
+        if not await order_payment_confirmed(order):
+            await message.answer(
+                f"⚠️ Автостатусы для <b>{safe(code)}</b> пока нельзя включить.\n\n"
+                "Сначала клиент должен оплатить груз, после оплаты админ получит уведомление и сможет включить автостатусы.",
+                reply_markup=admin_keyboard(),
+            )
+            return
         updated = await enable_auto_status_for_order(order["id"], message.from_user.id)
         route_name = auto_route_label(updated["auto_status_route"] or choose_auto_route(updated["from_country"] or "", updated["to_city"] or ""))
         await message.answer(
@@ -2631,7 +2668,7 @@ async def cmd_autostatus_all(message: Message):
     count = await enable_auto_status_for_active_orders(message.from_user.id)
     await message.answer(
         f"✅ Автостатусы включены для активных грузов: {count}.\n\n"
-        "Новые заявки также получают автостатусы автоматически, если AUTO_STATUS_ON_NEW_ORDERS=true.",
+        "Автостатусы включаются только для оплаченных активных грузов.",
         reply_markup=admin_keyboard(),
     )
 
@@ -4704,9 +4741,21 @@ async def cb_auto_enable(call: CallbackQuery):
         await call.answer("Нет доступа", show_alert=True)
         return
     order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    if not await order_payment_confirmed(order):
+        await call.answer("Сначала должна пройти оплата", show_alert=True)
+        await call.message.answer(
+            f"⚠️ Автостатусы для <b>{safe(order['tracking_code'])}</b> пока не включены.\n\n"
+            "Логика такая: клиент оформляет доставку → оплачивает → админу приходит уведомление → только потом админ включает автостатусы.",
+            reply_markup=admin_keyboard(),
+        )
+        return
     updated = await enable_auto_status_for_order(order_id, call.from_user.id)
     if not updated:
-        await call.answer("Груз не найден", show_alert=True)
+        await call.answer("Не удалось включить автостатусы", show_alert=True)
         return
     route_name = auto_route_label(updated["auto_status_route"] or choose_auto_route(updated["from_country"] or "", updated["to_city"] or ""))
     await call.message.answer(
@@ -5338,6 +5387,7 @@ async def demo_payment_success_page(request: web.Request) -> web.Response:
             await notify_admins(
                 bot,
                 admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+                reply_markup=order_actions_keyboard(updated["id"]),
             )
 
     content = f"""
@@ -5399,6 +5449,7 @@ async def api_demo_payment_success(request: web.Request) -> web.Response:
             await notify_admins(
                 bot,
                 admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+                reply_markup=order_actions_keyboard(updated["id"]),
             )
 
     return web.json_response({
