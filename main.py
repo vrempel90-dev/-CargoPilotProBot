@@ -72,7 +72,7 @@ PUBLIC_BASE_URL = (
 
 # CargoPilot SmartFlow: уникальные функции контроля грузов.
 ISSUE_STALE_HOURS = int(os.getenv("ISSUE_STALE_HOURS", "24"))
-OWNER_REPORT_ENABLED = os.getenv("OWNER_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OWNER_REPORT_ENABLED = os.getenv("OWNER_REPORT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 OWNER_REPORT_INTERVAL_SECONDS = int(os.getenv("OWNER_REPORT_INTERVAL_SECONDS", "86400"))
 
 # CargoPilot TrustFlow: не просто статус, а понятное объяснение для клиента.
@@ -5368,13 +5368,18 @@ async def start_health_server(bot: Bot) -> None:
 
 
 async def owner_report_loop(bot: Bot) -> None:
+    """Резервная функция авто-отчёта.
+
+    По умолчанию не запускается. Отчёт админ получает вручную через кнопку
+    📊 SmartFlow отчёт, чтобы бот не присылал отчёты сам и не сбивал меню.
+    """
     if not OWNER_REPORT_ENABLED:
         return
-    await asyncio.sleep(30)
+    await asyncio.sleep(max(3600, OWNER_REPORT_INTERVAL_SECONDS))
     while True:
         try:
             text = await owner_smartflow_report_text()
-            await notify_admins(bot, text)
+            await notify_admins(bot, text, reply_markup=admin_keyboard())
         except Exception as e:
             logger.exception("Owner SmartFlow report failed: %s", e)
         await asyncio.sleep(max(3600, OWNER_REPORT_INTERVAL_SECONDS))
@@ -5387,7 +5392,6 @@ async def main() -> None:
     dp.include_router(router)
     asyncio.create_task(start_health_server(bot))
     asyncio.create_task(auto_status_loop(bot))
-    asyncio.create_task(owner_report_loop(bot))
     logger.info("Starting polling. DB=%s", DB_PATH)
     await dp.start_polling(bot)
 
