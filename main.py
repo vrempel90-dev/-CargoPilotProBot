@@ -70,6 +70,17 @@ PUBLIC_BASE_URL = (
     or "https://cargopilotprobot-production.up.railway.app"
 ).strip().rstrip("/")
 
+# CargoPilot SmartFlow: уникальные функции контроля грузов.
+ISSUE_STALE_HOURS = int(os.getenv("ISSUE_STALE_HOURS", "24"))
+OWNER_REPORT_ENABLED = os.getenv("OWNER_REPORT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OWNER_REPORT_INTERVAL_SECONDS = int(os.getenv("OWNER_REPORT_INTERVAL_SECONDS", "86400"))
+
+# CargoPilot TrustFlow: не просто статус, а понятное объяснение для клиента.
+# Показывает: всё по плану / возможна задержка / нужна проверка.
+TRUSTFLOW_ENABLED = os.getenv("TRUSTFLOW_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+TRUSTFLOW_GRACE_HOURS = int(os.getenv("TRUSTFLOW_GRACE_HOURS", "12"))
+BOT_USERNAME = (os.getenv("BOT_USERNAME") or "CargoPilotProBot").strip().lstrip("@")
+
 # Бесплатные автостатусы: бот сам меняет статус по срокам маршрута.
 # Не требует WhatsApp API, OpenAI, Gemini, Kaspi API или других платных сервисов.
 AUTO_STATUS_ENABLED = os.getenv("AUTO_STATUS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -336,7 +347,8 @@ def admin_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="💸 Долги/оплаты")],
             [KeyboardButton(text="💰 Финансы"), KeyboardButton(text="🛠️ Техподдержка")],
             [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🚚 Курьеры")],
-            [KeyboardButton(text="📦 Партии"), KeyboardButton(text="👥 Клиенты")],
+            [KeyboardButton(text="📦 Партии"), KeyboardButton(text="🚨 Проблемные грузы")],
+            [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="📊 SmartFlow отчёт")],
             [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
             [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="⚙️ Статусы")],
             [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="📢 Рассылка")],
@@ -403,6 +415,8 @@ def admin_menu_text() -> str:
         "💬 жалобы — ответы клиентам\n"
         "🛠️ техподдержка — тикеты, ответы и закрытие обращений\n"
         "🚚 курьеры — выдача и доставка по городу\n"
+        "📦 партии — менять статус сразу группе грузов\n"
+        "🚨 SmartFlow — сам показывает проблемные грузы, долги и обращения\n"
         "📤 Excel — только для отчётов и массовых обновлений\n\n"
         "Для работы на компьютере откройте обычный <b>Telegram Desktop</b> и пользуйтесь этим же меню."
     )
@@ -771,6 +785,14 @@ async def init_db() -> None:
                 name TEXT UNIQUE,
                 created_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS track_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tracking_code TEXT,
+                ip TEXT,
+                user_agent TEXT,
+                created_at TEXT
+            );
             """
         )
         for sql in [
@@ -875,6 +897,134 @@ def auto_route_label(route_key: str) -> str:
     route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
     return route["name"]
 
+
+STATUS_EXPLANATIONS = {
+    "новая заявка": "Заявка принята. Груз ещё не прошёл складскую обработку.",
+    "принят на склад": "Груз принят на склад отправителя. Следующий этап — отправка по маршруту.",
+    "ожидает отправки": "Груз готовится к отправке. Обычно он ждёт формирования партии.",
+    "отправлен": "Груз отправлен по маршруту. Обновление появится после следующего этапа движения.",
+    "в пути": "Груз находится между складами или городами. На этом этапе статус может обновляться не каждый день.",
+    "на таможне": "Груз проходит таможенный этап. Возможны задержки из-за проверки документов или партии.",
+    "прибыл в страну": "Груз прибыл в страну назначения и ожидает дальнейшую сортировку.",
+    "прибыл в Казахстан": "Груз прибыл в Казахстан и ожидает сортировку или доставку по городу.",
+    "прибыл в город": "Груз прибыл в город получателя и готовится к выдаче.",
+    "готов к выдаче": "Груз готов к получению. Можно связаться с менеджером для уточнения выдачи.",
+    "передан курьеру": "Груз передан курьеру для доставки.",
+    "доставлен": "Груз доставлен клиенту.",
+    "проблема": "По грузу нужна проверка менеджера. Возможна задержка, уточнение оплаты или данных.",
+    "отменён": "Заявка отменена.",
+}
+
+
+def status_explanation(status: str) -> str:
+    return STATUS_EXPLANATIONS.get(normalize(status), "Статус обновлён. Следующее изменение появится после обработки груза.")
+
+
+def _route_stage_index(route_key: str, status: str) -> int:
+    route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
+    stage_statuses = [s for _, s, _ in route["stages"]]
+    status = normalize(status)
+    return stage_statuses.index(status) if status in stage_statuses else -1
+
+
+def _stage_due_datetime(started_at: datetime, stage_value: int) -> datetime:
+    if AUTO_STATUS_TIME_UNIT == "minutes":
+        return started_at + timedelta(minutes=stage_value)
+    return started_at + timedelta(days=stage_value)
+
+
+def trustflow_info(order: aiosqlite.Row) -> dict:
+    """Клиентская логика Anti-'Где мой груз?'.
+
+    Показывает не только статус, а:
+    - что этот статус значит;
+    - следующий этап;
+    - когда ждать обновление;
+    - нужно ли писать менеджеру.
+    """
+    status = order["status"] or "новая заявка"
+    route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
+    route = AUTO_STATUS_ROUTES.get(route_key) or AUTO_STATUS_ROUTES["cis_local"]
+    started_at = parse_iso_datetime(order["auto_status_started_at"] or order["created_at"] or now_iso())
+
+    current_index = _route_stage_index(route_key, status)
+    next_stage = None
+    next_due = None
+    if 0 <= current_index < len(route["stages"]) - 1:
+        day, next_status, next_comment = route["stages"][current_index + 1]
+        next_due = _stage_due_datetime(started_at, day)
+        next_stage = {
+            "status": next_status,
+            "comment": next_comment,
+            "due_at": next_due,
+        }
+
+    now = datetime.now(timezone.utc)
+    normalized_status = normalize(status)
+
+    if normalized_status in {"проблема", "отменён"}:
+        level = "red"
+        label = "Нужна проверка менеджером"
+        client_hint = "По грузу есть вопрос. Лучше связаться с менеджером."
+        show_support = True
+    elif next_due and now > next_due + timedelta(hours=TRUSTFLOW_GRACE_HOURS):
+        level = "yellow"
+        label = "Возможна задержка"
+        client_hint = "Ожидаемый этап уже должен был обновиться. Менеджеру стоит проверить груз."
+        show_support = True
+    else:
+        level = "green"
+        label = "Всё идёт по плану"
+        client_hint = "Писать менеджеру не нужно: следующее обновление появится автоматически."
+        show_support = False
+
+    if normalized_status in {"готов к выдаче", "доставлен", "передан курьеру"}:
+        level = "green"
+        label = "Груз на финальном этапе"
+        client_hint = "Можно уточнить получение или доставку у менеджера."
+        show_support = normalized_status != "доставлен"
+
+    due_text = ""
+    if next_stage and next_due:
+        due_text = next_due.strftime("%d.%m.%Y %H:%M") if AUTO_STATUS_TIME_UNIT == "minutes" else next_due.strftime("%d.%m.%Y")
+
+    return {
+        "level": level,
+        "label": label,
+        "status_explanation": status_explanation(status),
+        "next_stage": next_stage["status"] if next_stage else "финальный этап",
+        "next_comment": next_stage["comment"] if next_stage else "Груз находится на завершающем этапе.",
+        "next_due_text": due_text,
+        "client_hint": client_hint,
+        "show_support": show_support,
+        "route_name": route["name"],
+    }
+
+
+async def record_track_view(code: str, request: Optional[web.Request] = None) -> None:
+    ip = ""
+    user_agent = ""
+    if request:
+        ip = request.headers.get("X-Forwarded-For", request.remote or "")
+        user_agent = request.headers.get("User-Agent", "")[:300]
+    async with get_db() as db:
+        await db.execute(
+            "INSERT INTO track_views (tracking_code, ip, user_agent, created_at) VALUES (?, ?, ?, ?)",
+            (code.upper(), ip, user_agent, now_iso()),
+        )
+        await db.commit()
+
+
+async def track_view_stats(code: Optional[str] = None) -> dict:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    async with get_db() as db:
+        if code:
+            total = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views WHERE UPPER(tracking_code)=UPPER(?)", (code,))
+            today_row = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views WHERE UPPER(tracking_code)=UPPER(?) AND created_at LIKE ?", (code, f"{today}%",))
+        else:
+            total = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views")
+            today_row = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views WHERE created_at LIKE ?", (f"{today}%",))
+    return {"total": total["cnt"] if total else 0, "today": today_row["cnt"] if today_row else 0}
 
 async def enable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
     """Включает бесплатные автостатусы одной кнопкой.
@@ -1103,6 +1253,137 @@ def format_client_row(row: aiosqlite.Row) -> str:
     username = f"@{row['username']}" if row['username'] else ''
     debt = max(float(row['debt'] or 0), 0)
     return f"<b>{safe(name or username or row['telegram_id'])}</b> · ID <code>{row['telegram_id']}</code>\nЗаказов: {row['orders_count']} · Долг: {debt} {safe(CURRENCY)}"
+
+async def smart_cargo_card_data(order_id: int) -> dict:
+    """Данные для умной карточки груза: история, оплаты, фото, тикеты."""
+    async with get_db() as db:
+        order = await db_fetchone(db, "SELECT * FROM orders WHERE id=?", (order_id,))
+        if not order:
+            return {}
+        history = await db_fetchall(db, "SELECT * FROM status_history WHERE order_id=? ORDER BY id ASC", (order_id,))
+        photos = await db_fetchall(db, "SELECT * FROM cargo_photos WHERE order_id=? ORDER BY id DESC LIMIT 5", (order_id,))
+        payments = await db_fetchall(db, "SELECT * FROM payments WHERE order_id=? ORDER BY id DESC LIMIT 10", (order_id,))
+        tickets = await db_fetchall(
+            db,
+            "SELECT * FROM support_tickets WHERE tracking_code=? ORDER BY id DESC LIMIT 5",
+            (order["tracking_code"],),
+        )
+    return {"order": order, "history": history, "photos": photos, "payments": payments, "tickets": tickets}
+
+
+async def smartflow_problem_radar(limit: int = 20) -> dict:
+    """Показывает проблемные места без ручного поиска по CRM.
+
+    Это главная уникальная логика: система сама подсвечивает, где нужны действия.
+    """
+    stale_cutoff = (datetime.now(timezone.utc) - timedelta(hours=ISSUE_STALE_HOURS)).isoformat(timespec="seconds")
+    async with get_db() as db:
+        stale = await db_fetchall(
+            db,
+            """
+            SELECT * FROM orders
+            WHERE status NOT IN ('доставлен', 'отменён')
+              AND COALESCE(updated_at, created_at) < ?
+            ORDER BY updated_at ASC
+            LIMIT ?
+            """,
+            (stale_cutoff, limit),
+        )
+        no_weight = await db_fetchall(
+            db,
+            """
+            SELECT * FROM orders
+            WHERE status NOT IN ('доставлен', 'отменён')
+              AND COALESCE(weight, 0) <= 0
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        debtors = await db_fetchall(
+            db,
+            """
+            SELECT *, (COALESCE(price, 0) - COALESCE(paid_amount, 0)) AS debt
+            FROM orders
+            WHERE COALESCE(price, 0) > COALESCE(paid_amount, 0)
+            ORDER BY debt DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        open_complaints = await db_fetchall(
+            db,
+            "SELECT * FROM complaints WHERE status='open' ORDER BY id DESC LIMIT ?",
+            (limit,),
+        )
+        open_tickets = await db_fetchall(
+            db,
+            "SELECT * FROM support_tickets WHERE status!='closed' ORDER BY updated_at DESC LIMIT ?",
+            (limit,),
+        )
+        active_total = await db_fetchone(
+            db,
+            "SELECT COUNT(*) AS cnt FROM orders WHERE status NOT IN ('доставлен', 'отменён')",
+        )
+    return {
+        "stale": stale,
+        "no_weight": no_weight,
+        "debtors": debtors,
+        "open_complaints": open_complaints,
+        "open_tickets": open_tickets,
+        "active_total": active_total["cnt"] if active_total else 0,
+    }
+
+
+def _problem_codes(rows: list[aiosqlite.Row], max_items: int = 5) -> str:
+    if not rows:
+        return "нет"
+    codes = []
+    for r in rows[:max_items]:
+        code = r["tracking_code"] if "tracking_code" in r.keys() else f"#{r['id']}"
+        codes.append(str(code))
+    extra = f" +{len(rows) - max_items}" if len(rows) > max_items else ""
+    return ", ".join(codes) + extra
+
+
+def format_problem_radar(radar: dict) -> str:
+    return (
+        "<b>🚨 SmartFlow: проблемные грузы</b>\n\n"
+        f"Активных грузов: <b>{radar.get('active_total', 0)}</b>\n\n"
+        f"⏳ Давно без обновления: <b>{len(radar['stale'])}</b>\n"
+        f"{safe(_problem_codes(radar['stale']))}\n\n"
+        f"⚖️ Без веса: <b>{len(radar['no_weight'])}</b>\n"
+        f"{safe(_problem_codes(radar['no_weight']))}\n\n"
+        f"💸 С долгом: <b>{len(radar['debtors'])}</b>\n"
+        f"{safe(_problem_codes(radar['debtors']))}\n\n"
+        f"⚠️ Открытых жалоб: <b>{len(radar['open_complaints'])}</b>\n"
+        f"🛠️ Открытых обращений: <b>{len(radar['open_tickets'])}</b>\n\n"
+        "Это не просто список заявок: система сама показывает, где менеджеру нужно действие."
+    )
+
+
+async def owner_smartflow_report_text() -> str:
+    finance = await finance_report()
+    radar = await smartflow_problem_radar(10)
+    views = await track_view_stats()
+    totals = finance["totals"]
+    today = finance["today"]
+    return (
+        "<b>📊 Ежедневный SmartFlow-отчёт владельцу</b>\n\n"
+        f"Сегодня заявок: <b>{today['today_orders']}</b>\n"
+        f"Сегодня оборот: <b>{today['today_revenue']} {safe(CURRENCY)}</b>\n"
+        f"Сегодня маржа: <b>{today['today_margin']} {safe(CURRENCY)}</b>\n"
+        f"Клиенты сами проверили грузы сегодня: <b>{views['today']}</b>\n\n"
+        f"Всего заявок: <b>{totals['total_orders']}</b>\n"
+        f"Всего оборот: <b>{totals['revenue']} {safe(CURRENCY)}</b>\n"
+        f"Всего маржа: <b>{totals['margin']} {safe(CURRENCY)}</b>\n\n"
+        f"🚨 Без обновления: <b>{len(radar['stale'])}</b>\n"
+        f"⚖️ Без веса: <b>{len(radar['no_weight'])}</b>\n"
+        f"💸 С долгом: <b>{len(radar['debtors'])}</b>\n"
+        f"⚠️ Жалобы: <b>{len(radar['open_complaints'])}</b>\n"
+        f"🛠️ Тикеты: <b>{len(radar['open_tickets'])}</b>\n\n"
+        "Владелец видит картину сам, без ручного поиска по чатам и таблицам."
+    )
 
 async def disable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
     order = await get_order(order_id)
@@ -3561,6 +3842,21 @@ async def admin_support_menu(message: Message):
         await message.answer(format_support_ticket(t) + f"\n\nОтветить: /replyticket {t['id']} ваш текст", reply_markup=support_ticket_actions_keyboard(t["id"]))
 
 
+@router.message(F.text == "🚨 Проблемные грузы")
+async def admin_problem_radar(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    radar = await smartflow_problem_radar(20)
+    await message.answer(format_problem_radar(radar), reply_markup=admin_keyboard())
+
+
+@router.message(F.text == "📊 SmartFlow отчёт")
+async def admin_smartflow_report(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    await message.answer(await owner_smartflow_report_text(), reply_markup=admin_keyboard())
+
+
 @router.message(F.text == "💰 Финансы")
 @router.message(F.text == "📊 Отчёт за день")
 async def admin_finance(message: Message):
@@ -4521,6 +4817,17 @@ def _track_layout(title: str, content: str) -> str:
     .value {{ font-size:17px; font-weight:700; color:#0f2744; }}
     .status {{ display:inline-flex; align-items:center; gap:8px; color:white; border-radius:999px; padding:10px 14px; font-weight:700; }}
     .history {{ margin-top:20px; border-top:1px solid var(--line); padding-top:16px; }}
+    .smart {{ margin-top:16px; padding:16px; border-radius:18px; background:linear-gradient(135deg,#eef8ff,#f7fffb); border:1px solid #d8edf7; }}
+    .smart h3 {{ margin:0 0 8px; }}
+    .photos {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:10px; }}
+    .photo {{ background:#f1f5f9; border:1px solid var(--line); border-radius:12px; padding:10px; font-size:13px; color:var(--muted); }}
+    .support-btn {{ display:inline-block; margin-top:14px; padding:14px 16px; border-radius:14px; background:linear-gradient(135deg,var(--blue),var(--cyan)); color:white; font-weight:700; }}
+    .trust {{ margin-top:16px; padding:18px; border-radius:20px; border:1px solid #d8edf7; }}
+    .trust.green {{ background:#effcf6; border-color:#b9efd3; }}
+    .trust.yellow {{ background:#fff8e7; border-color:#ffe0a3; }}
+    .trust.red {{ background:#fff1f1; border-color:#ffc4c4; }}
+    .trust-title {{ font-size:21px; font-weight:800; margin-bottom:8px; }}
+    .trust-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }}
     .hrow {{ display:flex; gap:12px; padding:10px 0; border-bottom:1px solid #f0f3f7; }}
     .dot {{ width:10px; height:10px; border-radius:50%; background:var(--blue); margin-top:5px; flex:0 0 auto; }}
     .hdate {{ color:var(--muted); font-size:13px; min-width:132px; }}
@@ -4575,29 +4882,40 @@ async def track_page(request: web.Request) -> web.Response:
     code = (request.query.get("code") or "").strip().upper()
     if not code:
         return _web_response(_track_layout("Проверка груза", _track_form()))
-    return await render_tracking_result(code)
+    return await render_tracking_result(code, request)
 
 
 async def track_code_page(request: web.Request) -> web.Response:
     code = (request.match_info.get("code") or "").strip().upper()
-    return await render_tracking_result(code)
+    return await render_tracking_result(code, request)
 
 
-async def render_tracking_result(code: str) -> web.Response:
+async def render_tracking_result(code: str, request: Optional[web.Request] = None) -> web.Response:
     order = await get_order_by_code(code)
     if not order:
         return _web_response(_track_layout("Груз не найден", _track_form(code, "Груз с таким номером не найден.")), status=404)
-    async with get_db() as db:
-        history = await db_fetchall(
-            db,
-            "SELECT status, comment, created_at FROM status_history WHERE order_id=? ORDER BY id ASC",
-            (order["id"],),
-        )
+
+    await record_track_view(order["tracking_code"], request)
+
+    data = await smart_cargo_card_data(order["id"])
+    history = data.get("history", [])
+    photos = data.get("photos", [])
+    tickets = data.get("tickets", [])
+    views = await track_view_stats(order["tracking_code"])
+    trust = trustflow_info(order)
+
     status = order["status"] or "новая заявка"
     badge_color = _status_badge_color(status)
     route = f"{html.escape(str(order['from_country'] or '—'))} → {html.escape(str(order['to_city'] or '—'))}"
     updated = html.escape(((order["updated_at"] or order["created_at"] or "")[:16]).replace("T", " "))
-    history_html = ""
+
+    price = float(order["price"] or 0)
+    paid = float(order["paid_amount"] or 0)
+    debt = max(price - paid, 0)
+    payment_text = "оплачено" if price > 0 and debt <= 0 else "частично" if paid > 0 else "не указано"
+    if price > 0 and debt > 0:
+        payment_text = f"долг {debt:g} {html.escape(CURRENCY)}"
+
     if history:
         rows = []
         for h in history:
@@ -4608,6 +4926,51 @@ async def render_tracking_result(code: str) -> web.Response:
         history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3>' + "".join(rows) + "</div>"
     else:
         history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3><div class="hint">История пока пустая.</div></div>'
+
+    photos_html = ""
+    if photos:
+        items = []
+        for p in photos[:5]:
+            dt = html.escape(((p["created_at"] or "")[:16]).replace("T", " "))
+            comment = html.escape(p["comment"] or "Фото груза")
+            items.append(f'<div class="photo">📷 {comment}<br><span>{dt}</span></div>')
+        photos_html = '<div class="smart"><h3>Фото груза</h3><div class="photos">' + "".join(items) + "</div></div>"
+
+    support_status = "нет открытых обращений"
+    if tickets:
+        open_count = len([t for t in tickets if t["status"] != "closed"])
+        support_status = f"{open_count} открытых обращений" if open_count else "обращения закрыты"
+
+    support_button = ""
+    if trust["show_support"]:
+        support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Проверить у менеджера</a>'
+
+    trust_html = f"""
+      <div class="trust {html.escape(trust['level'])}">
+        <div class="trust-title">{'🟢' if trust['level']=='green' else '🟡' if trust['level']=='yellow' else '🔴'} {html.escape(trust['label'])}</div>
+        <div>{html.escape(trust['status_explanation'])}</div>
+        <div class="trust-grid">
+          <div class="item"><div class="label">Следующий этап</div><div class="value">{html.escape(trust['next_stage'])}</div></div>
+          <div class="item"><div class="label">Ожидаем обновление</div><div class="value">{html.escape(trust['next_due_text'] or 'по обработке')}</div></div>
+        </div>
+        <div class="hint" style="margin-top:12px;">{html.escape(trust['client_hint'])}</div>
+        {support_button}
+      </div>
+    """
+
+    smart_summary = f"""
+      <div class="smart">
+        <h3>Smart-карточка груза</h3>
+        <div class="hint">Клиент видит не просто статус, а понятное объяснение, следующий этап и нужно ли писать менеджеру.</div>
+        <div class="grid" style="margin-top:12px;">
+          <div class="item"><div class="label">Оплата</div><div class="value">{html.escape(payment_text)}</div></div>
+          <div class="item"><div class="label">Обращения</div><div class="value">{html.escape(support_status)}</div></div>
+          <div class="item"><div class="label">Просмотров ссылки</div><div class="value">{views['total']}</div></div>
+          <div class="item"><div class="label">Маршрут SmartFlow</div><div class="value">{html.escape(trust['route_name'])}</div></div>
+        </div>
+      </div>
+    """
+
     content = f"""
       <h2 style="margin:0 0 8px;">Груз {html.escape(order['tracking_code'])}</h2>
       <div class="status" style="background:{badge_color};">● {html.escape(status)}</div>
@@ -4617,6 +4980,9 @@ async def render_tracking_result(code: str) -> web.Response:
         <div class="item"><div class="label">Вес</div><div class="value">{html.escape(str(order['weight'] or '—'))} кг</div></div>
         <div class="item"><div class="label">Последнее обновление</div><div class="value">{updated or '—'}</div></div>
       </div>
+      {trust_html}
+      {smart_summary}
+      {photos_html}
       {history_html}
       <form class="form" method="get" action="/track" style="margin-top:20px;">
         <input name="code" placeholder="Проверить другой номер CG..." autocomplete="off" />
@@ -4631,19 +4997,31 @@ async def api_track_order(request: web.Request) -> web.Response:
     order = await get_order_by_code(code)
     if not order:
         return web.json_response({"ok": False, "error": "not_found"}, status=404)
-    async with get_db() as db:
-        history = await db_fetchall(db, "SELECT status, comment, created_at FROM status_history WHERE order_id=? ORDER BY id ASC", (order["id"],))
+    data = await smart_cargo_card_data(order["id"])
+    history = data.get("history", [])
+    photos = data.get("photos", [])
+    tickets = data.get("tickets", [])
+    trust = trustflow_info(order)
+    views = await track_view_stats(order["tracking_code"])
     return web.json_response({
         "ok": True,
         "tracking_code": order["tracking_code"],
         "status": order["status"],
+        "trustflow": trust,
         "from_country": order["from_country"],
         "to_city": order["to_city"],
         "cargo_type": order["cargo_type"],
         "weight": order["weight"],
+        "price": order["price"],
+        "paid_amount": order["paid_amount"],
+        "payment_status": order["payment_status"],
         "updated_at": order["updated_at"],
         "history": [{"status": h["status"], "comment": h["comment"], "created_at": h["created_at"]} for h in history],
+        "photos_count": len(photos),
+        "open_tickets_count": len([t for t in tickets if t["status"] != "closed"]),
+        "track_views": views,
     })
+
 
 # =========================
 # HEALTH SERVER
@@ -4668,6 +5046,19 @@ async def start_health_server(bot: Bot) -> None:
     logger.info("Health server started on port %s", PORT)
 
 
+async def owner_report_loop(bot: Bot) -> None:
+    if not OWNER_REPORT_ENABLED:
+        return
+    await asyncio.sleep(30)
+    while True:
+        try:
+            text = await owner_smartflow_report_text()
+            await notify_admins(bot, text)
+        except Exception as e:
+            logger.exception("Owner SmartFlow report failed: %s", e)
+        await asyncio.sleep(max(3600, OWNER_REPORT_INTERVAL_SECONDS))
+
+
 async def main() -> None:
     await init_db()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
@@ -4675,6 +5066,7 @@ async def main() -> None:
     dp.include_router(router)
     asyncio.create_task(start_health_server(bot))
     asyncio.create_task(auto_status_loop(bot))
+    asyncio.create_task(owner_report_loop(bot))
     logger.info("Starting polling. DB=%s", DB_PATH)
     await dp.start_polling(bot)
 
