@@ -81,6 +81,11 @@ TRUSTFLOW_ENABLED = os.getenv("TRUSTFLOW_ENABLED", "true").strip().lower() in {"
 TRUSTFLOW_GRACE_HOURS = int(os.getenv("TRUSTFLOW_GRACE_HOURS", "12"))
 BOT_USERNAME = (os.getenv("BOT_USERNAME") or "CargoPilotProBot").strip().lstrip("@")
 
+# CargoPromise OS: контроль обещаний, рисков и доверия.
+PROMISE_OS_ENABLED = os.getenv("PROMISE_OS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+PROMISE_STALE_HOURS = int(os.getenv("PROMISE_STALE_HOURS", "24"))
+PROMISE_HIGH_TRACK_VIEWS = int(os.getenv("PROMISE_HIGH_TRACK_VIEWS", "5"))
+
 # Demo Bank Payments: виртуальные банки для показа клиенту.
 # Это НЕ реальная оплата и НЕ списывает деньги.
 DEMO_PAYMENT_ENABLED = os.getenv("DEMO_PAYMENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
@@ -376,13 +381,10 @@ def client_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="📦 Оформить доставку"), KeyboardButton(text="🔎 Где мой груз?")],
-            [KeyboardButton(text="🧮 Рассчитать доставку"), KeyboardButton(text="🛒 Выкуп товара")],
-            [KeyboardButton(text="🏢 Оптовая доставка"), KeyboardButton(text="⚠️ Жалоба / проблема")],
-            [KeyboardButton(text="🛠️ Техподдержка"), KeyboardButton(text="💳 Оплатить доставку")],
-            [KeyboardButton(text="👤 Мой кабинет"), KeyboardButton(text="📋 Мои заказы")],
-            [KeyboardButton(text="🕓 История статусов"), KeyboardButton(text="📷 Фото груза")],
-            [KeyboardButton(text="🔳 QR груза"), KeyboardButton(text="❓ FAQ")],
-            [KeyboardButton(text="🤝 Партнёрка")],
+            [KeyboardButton(text="💳 Оплатить доставку"), KeyboardButton(text="🛠️ Техподдержка")],
+            [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="🧮 Рассчитать доставку")],
+            [KeyboardButton(text="🛒 Выкуп товара"), KeyboardButton(text="🏢 Оптовая доставка")],
+            [KeyboardButton(text="⚠️ Жалоба / проблема"), KeyboardButton(text="❓ FAQ")],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие или напишите номер груза CG...",
@@ -390,26 +392,22 @@ def client_keyboard() -> ReplyKeyboardMarkup:
 
 
 def admin_keyboard() -> ReplyKeyboardMarkup:
-    # Важные кнопки держим в первых строках: в Telegram Desktop нижние строки
-    # reply-клавиатуры иногда скрываются, если окно маленькое.
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="📥 Новые заявки"), KeyboardButton(text="📦 Все грузы")],
-            [KeyboardButton(text="🤖 Автостатусы"), KeyboardButton(text="🔁 Изменить статус")],
-            [KeyboardButton(text="🔎 Найти груз"), KeyboardButton(text="💸 Долги/оплаты")],
-            [KeyboardButton(text="💰 Финансы"), KeyboardButton(text="🛠️ Техподдержка")],
-            [KeyboardButton(text="💬 Жалобы"), KeyboardButton(text="🚚 Курьеры")],
+            [KeyboardButton(text="🧭 Promise OS"), KeyboardButton(text="📥 Новые заявки")],
+            [KeyboardButton(text="📦 Все грузы"), KeyboardButton(text="🔎 Найти груз")],
+            [KeyboardButton(text="💳 Оплаты/долги"), KeyboardButton(text="🤖 Автостатусы")],
             [KeyboardButton(text="📦 Партии"), KeyboardButton(text="🚨 Проблемные грузы")],
-            [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="📊 SmartFlow отчёт")],
+            [KeyboardButton(text="🔁 Изменить статус"), KeyboardButton(text="🏭 Меню склада")],
+            [KeyboardButton(text="🛠️ Техподдержка"), KeyboardButton(text="💬 Жалобы")],
+            [KeyboardButton(text="👥 Клиенты"), KeyboardButton(text="📢 Рассылка")],
             [KeyboardButton(text="📤 Excel экспорт"), KeyboardButton(text="📥 Обновить из Excel")],
             [KeyboardButton(text="⚙️ Тарифы"), KeyboardButton(text="⚙️ Статусы")],
-            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="📢 Рассылка")],
-            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="🤝 Партнёры")],
-            [KeyboardButton(text="👥 Роли"), KeyboardButton(text="🏭 Меню склада")],
-            [KeyboardButton(text="👤 Клиентское меню")],
+            [KeyboardButton(text="📄 PDF квитанция"), KeyboardButton(text="👥 Роли")],
+            [KeyboardButton(text="📊 Отчёт за день"), KeyboardButton(text="👤 Клиентское меню")],
         ],
         resize_keyboard=True,
-        input_field_placeholder="Админ-панель: выберите действие",
+        input_field_placeholder="CargoPromise OS: выберите действие",
     )
 
 
@@ -468,7 +466,7 @@ def admin_menu_text() -> str:
         "🛠️ техподдержка — тикеты, ответы и закрытие обращений\n"
         "🚚 курьеры — выдача и доставка по городу\n"
         "📦 партии — менять статус сразу группе грузов\n"
-        "🚨 SmartFlow — сам показывает проблемные грузы, долги и обращения\n"
+        "🧭 Promise OS — обещания клиенту, риск спора, тревожность и потери\n"
         "📤 Excel — только для отчётов и массовых обновлений\n\n"
         "Для работы на компьютере откройте обычный <b>Telegram Desktop</b> и пользуйтесь этим же меню."
     )
@@ -1116,6 +1114,218 @@ async def track_view_stats(code: Optional[str] = None) -> dict:
             total = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views")
             today_row = await db_fetchone(db, "SELECT COUNT(*) AS cnt FROM track_views WHERE created_at LIKE ?", (f"{today}%",))
     return {"total": total["cnt"] if total else 0, "today": today_row["cnt"] if today_row else 0}
+
+
+def promise_route_window(order: aiosqlite.Row) -> tuple[str, str, str]:
+    route_key = order["auto_status_route"] or choose_auto_route(order["from_country"] or "", order["to_city"] or "")
+    if route_key == "china_cis":
+        return "12–16 дней", "после оплаты и принятия на склад", "Не обещать точную дату прибытия до формирования партии."
+    if route_key == "turkey_cis":
+        return "7–12 дней", "после оплаты и принятия на склад", "Предупредить, что сроки зависят от партии и таможни."
+    if route_key == "uae_cis":
+        return "7–12 дней", "после оплаты и принятия на склад", "Предупредить про возможную проверку товара."
+    return "2–5 дней", "после оплаты и принятия на склад", "Не обещать доставку день-в-день без подтверждения склада."
+
+
+def row_has_open_items(rows: list[aiosqlite.Row]) -> bool:
+    for r in rows:
+        try:
+            if str(r["status"]).lower() != "closed":
+                return True
+        except Exception:
+            return True
+    return False
+
+
+def promise_os_profile(order: aiosqlite.Row, history: list[aiosqlite.Row], photos: list[aiosqlite.Row], tickets: list[aiosqlite.Row], views: dict) -> dict:
+    score = 100
+    risk_reasons = []
+    proof_points = []
+
+    paid = float(order["paid_amount"] or 0)
+    weight = float(order["weight"] or 0)
+    status = normalize(order["status"] or "")
+
+    if paid <= 0:
+        score -= 22
+        risk_reasons.append("оплата ещё не подтверждена")
+    else:
+        proof_points.append("оплата подтверждена")
+
+    if weight <= 0:
+        score -= 12
+        risk_reasons.append("не указан фактический вес")
+    else:
+        proof_points.append("вес указан")
+
+    if not photos:
+        score -= 10
+        risk_reasons.append("нет фото со склада")
+    else:
+        proof_points.append("фото груза добавлено")
+
+    if not int(order["auto_status_enabled"] or 0):
+        score -= 10
+        risk_reasons.append("автостатусы ещё не включены")
+    else:
+        proof_points.append("автостатусы включены")
+
+    updated_at = parse_iso_datetime(order["updated_at"] or order["created_at"] or now_iso())
+    stale_hours = (datetime.now(timezone.utc) - updated_at).total_seconds() / 3600
+    if status not in {"доставлен", "отменён"} and stale_hours > PROMISE_STALE_HOURS:
+        score -= 18
+        risk_reasons.append(f"нет обновления больше {PROMISE_STALE_HOURS} часов")
+
+    if status in {"проблема", "отменён"}:
+        score -= 35
+        risk_reasons.append("груз помечен как проблемный")
+
+    if row_has_open_items(tickets):
+        score -= 12
+        risk_reasons.append("есть открытое обращение клиента")
+
+    if views.get("today", 0) >= PROMISE_HIGH_TRACK_VIEWS:
+        score -= 8
+        risk_reasons.append("клиент часто проверяет трекер сегодня")
+
+    score = max(0, min(100, score))
+
+    anxiety = 0
+    anxiety += min(40, int(views.get("today", 0)) * 8)
+    anxiety += 25 if stale_hours > PROMISE_STALE_HOURS else 0
+    anxiety += 15 if not photos else 0
+    anxiety += 15 if paid <= 0 else 0
+    anxiety += 20 if status in {"проблема", "отменён"} else 0
+    anxiety = max(0, min(100, anxiety))
+
+    if score >= 80:
+        gate = "✅ Можно обещать"
+        level = "green"
+        client_label = "Всё по плану"
+    elif score >= 55:
+        gate = "⚠️ Обещать осторожно"
+        level = "yellow"
+        client_label = "Есть риск задержки или вопроса"
+    else:
+        gate = "🔴 Нужна проверка"
+        level = "red"
+        client_label = "Нужна проверка менеджером"
+
+    safe_window, promise_start, warning = promise_route_window(order)
+    if not risk_reasons:
+        risk_reasons.append("критичных рисков не найдено")
+    if not proof_points:
+        proof_points.append("доказательства ещё собираются")
+
+    return {
+        "score": score,
+        "anxiety": anxiety,
+        "gate": gate,
+        "level": level,
+        "client_label": client_label,
+        "safe_window": safe_window,
+        "promise_start": promise_start,
+        "warning": warning,
+        "risk_reasons": risk_reasons[:6],
+        "proof_points": proof_points[:6],
+        "stale_hours": round(stale_hours, 1),
+    }
+
+
+def promise_os_html(order: aiosqlite.Row, profile: dict) -> str:
+    risks = "".join(f"<li>{html.escape(str(x))}</li>" for x in profile["risk_reasons"])
+    proofs = "".join(f"<li>{html.escape(str(x))}</li>" for x in profile["proof_points"])
+    emoji = "🟢" if profile["level"] == "green" else "🟡" if profile["level"] == "yellow" else "🔴"
+    return f"""
+      <div class="promise {html.escape(profile['level'])}">
+        <div class="promise-head">
+          <div>
+            <div class="promise-kicker">CargoPromise OS</div>
+            <div class="promise-title">{emoji} {html.escape(profile['client_label'])}</div>
+          </div>
+          <div class="score">{profile['score']}<span>/100</span></div>
+        </div>
+        <div class="grid" style="margin-top:14px;">
+          <div class="item"><div class="label">Безопасное обещание</div><div class="value">{html.escape(profile['safe_window'])}</div></div>
+          <div class="item"><div class="label">Срок считать</div><div class="value">{html.escape(profile['promise_start'])}</div></div>
+          <div class="item"><div class="label">Anxiety Score</div><div class="value">{profile['anxiety']}/100</div></div>
+          <div class="item"><div class="label">Risk Gate</div><div class="value">{html.escape(profile['gate'])}</div></div>
+        </div>
+        <div class="promise-two">
+          <div>
+            <b>Риски обещания</b>
+            <ul>{risks}</ul>
+          </div>
+          <div>
+            <b>Доказательства по грузу</b>
+            <ul>{proofs}</ul>
+          </div>
+        </div>
+        <div class="hint"><b>Что нельзя обещать:</b> {html.escape(profile['warning'])}</div>
+      </div>
+    """
+
+
+async def promise_os_leak_map(limit: int = 10) -> dict:
+    radar = await smartflow_problem_radar(limit)
+    views = await track_view_stats()
+    async with get_db() as db:
+        risky = await db_fetchall(
+            db,
+            """
+            SELECT * FROM orders
+            WHERE status NOT IN ('доставлен', 'отменён')
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        debt_row = await db_fetchone(
+            db,
+            "SELECT COALESCE(SUM(COALESCE(price,0)-COALESCE(paid_amount,0)),0) AS debt FROM orders WHERE COALESCE(price,0)>COALESCE(paid_amount,0)",
+        )
+    top_profiles = []
+    for order in risky:
+        data = await smart_cargo_card_data(order["id"])
+        v = await track_view_stats(order["tracking_code"])
+        p = promise_os_profile(order, data.get("history", []), data.get("photos", []), data.get("tickets", []), v)
+        if p["score"] < 80 or p["anxiety"] >= 40:
+            top_profiles.append((order, p))
+    top_profiles.sort(key=lambda item: (item[1]["anxiety"], -item[1]["score"]), reverse=True)
+    return {
+        "radar": radar,
+        "views": views,
+        "debt": float(debt_row["debt"] or 0) if debt_row else 0,
+        "top_profiles": top_profiles[:limit],
+    }
+
+
+def format_promise_os_report(data: dict) -> str:
+    radar = data["radar"]
+    top = data["top_profiles"]
+    lines = [
+        "<b>🧭 CargoPromise OS</b>",
+        "",
+        "Карта обещаний, рисков и потерь по грузам.",
+        "",
+        f"Самопроверок трекера сегодня: <b>{data['views']['today']}</b>",
+        f"Долг / риск неоплаты: <b>{data['debt']:g} {safe(CURRENCY)}</b>",
+        f"Грузов без обновления: <b>{len(radar['stale'])}</b>",
+        f"Грузов без веса: <b>{len(radar['no_weight'])}</b>",
+        f"Открытых жалоб: <b>{len(radar['open_complaints'])}</b>",
+        f"Открытых тикетов: <b>{len(radar['open_tickets'])}</b>",
+        "",
+        "<b>Грузы, где может начаться вопрос/спор:</b>",
+    ]
+    if not top:
+        lines.append("Критичных рисков пока нет.")
+    else:
+        for order, p in top[:8]:
+            lines.append(f"— <b>{safe(order['tracking_code'])}</b>: TrustScore {p['score']}/100, Anxiety {p['anxiety']}/100 · {safe(p['gate'])}")
+    lines.append("")
+    lines.append("Смысл: не ждать жалоб, а видеть риск до того, как клиент напишет «где мой груз?»")
+    return "\n".join(lines)
+
 
 async def enable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Optional[aiosqlite.Row]:
     """Включает бесплатные автостатусы одной кнопкой.
@@ -3767,6 +3977,7 @@ async def qr_finish(message: Message, state: FSMContext, bot: Bot):
 
 
 @router.message(F.text == "💸 Долги/оплаты")
+@router.message(F.text == "💳 Оплаты/долги")
 async def admin_debts_button(message: Message):
     await cmd_debts(message)
 
@@ -4112,6 +4323,15 @@ async def admin_smartflow_report(message: Message):
     if not message.from_user or not is_admin(message.from_user.id):
         return
     await message.answer(await owner_smartflow_report_text(), reply_markup=admin_keyboard())
+
+
+@router.message(F.text == "🧭 Promise OS")
+@router.message(F.text == "📊 SmartFlow отчёт")
+async def admin_promise_os(message: Message):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    data = await promise_os_leak_map(12)
+    await message.answer(format_promise_os_report(data), reply_markup=admin_keyboard())
 
 
 @router.message(F.text == "💰 Финансы")
@@ -5097,6 +5317,19 @@ def _track_layout(title: str, content: str) -> str:
     .trust.red {{ background:#fff1f1; border-color:#ffc4c4; }}
     .trust-title {{ font-size:21px; font-weight:800; margin-bottom:8px; }}
     .trust-grid {{ display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:12px; }}
+    .promise {{ margin-top:18px; padding:20px; border-radius:22px; border:1px solid #d8edf7; }}
+    .promise.green {{ background:#effcf6; border-color:#b9efd3; }}
+    .promise.yellow {{ background:#fff8e7; border-color:#ffe0a3; }}
+    .promise.red {{ background:#fff1f1; border-color:#ffc4c4; }}
+    .promise-head {{ display:flex; align-items:center; justify-content:space-between; gap:16px; }}
+    .promise-kicker {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.05em; font-weight:700; }}
+    .promise-title {{ font-size:23px; font-weight:900; margin-top:4px; }}
+    .score {{ min-width:92px; min-height:92px; border-radius:50%; display:flex; align-items:center; justify-content:center; flex-direction:column; background:#0f2744; color:#fff; font-size:30px; font-weight:900; }}
+    .score span {{ font-size:13px; opacity:.8; }}
+    .promise-two {{ display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px; }}
+    .promise-two > div {{ background:rgba(255,255,255,.65); border:1px solid rgba(15,39,68,.08); border-radius:16px; padding:14px; }}
+    .promise ul {{ margin:8px 0 0 18px; padding:0; }}
+    @media (max-width:640px) {{ .promise-head {{ align-items:flex-start; }} .score {{ min-width:76px; min-height:76px; font-size:24px; }} .promise-two {{ grid-template-columns:1fr; }} }}
     .paybox {{ margin-top:16px; padding:18px; border-radius:20px; background:#f7fbff; border:1px solid #d8edf7; }}
     .pay-actions {{ display:flex; flex-wrap:wrap; gap:10px; margin-top:14px; }}
     .pay-link {{ display:inline-block; padding:14px 16px; border-radius:14px; background:linear-gradient(135deg,var(--blue),var(--cyan)); color:white; font-weight:700; }}
@@ -5127,10 +5360,10 @@ def _track_layout(title: str, content: str) -> str:
     <div class="shell">
       <div class="hero">
         <h1>{company}</h1>
-        <p>Проверка статуса груза по номеру заказа</p>
+        <p>CargoPromise OS: обещания, риски и доказательная история груза</p>
       </div>
       <div class="card">{content}</div>
-      <div class="footer">CargoPilot Web Track + Telegram-админка для сотрудников</div>
+      <div class="footer">CargoPromise OS · контроль обещаний и рисков в карго</div>
     </div>
   </div>
 </body>
@@ -5180,18 +5413,12 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
     tickets = data.get("tickets", [])
     views = await track_view_stats(order["tracking_code"])
     trust = trustflow_info(order)
+    promise = promise_os_profile(order, history, photos, tickets, views)
 
     status = order["status"] or "новая заявка"
     badge_color = _status_badge_color(status)
     route = f"{html.escape(str(order['from_country'] or '—'))} → {html.escape(str(order['to_city'] or '—'))}"
     updated = html.escape(((order["updated_at"] or order["created_at"] or "")[:16]).replace("T", " "))
-
-    price = float(order["price"] or 0)
-    paid = float(order["paid_amount"] or 0)
-    debt = max(price - paid, 0)
-    payment_text = "оплачено" if price > 0 and debt <= 0 else "частично" if paid > 0 else "не указано"
-    if price > 0 and debt > 0:
-        payment_text = f"долг {debt:g} {html.escape(CURRENCY)}"
 
     if history:
         rows = []
@@ -5200,9 +5427,9 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
             st = html.escape(h["status"] or "")
             comment = html.escape(h["comment"] or "")
             rows.append(f'<div class="hrow"><div class="dot"></div><div class="hdate">{dt}</div><div><div class="hstatus">{st}</div><div class="hint">{comment}</div></div></div>')
-        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3>' + "".join(rows) + "</div>"
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">Proof Timeline</h3><div class="hint">Доказательная история по грузу: что произошло и когда.</div>' + "".join(rows) + "</div>"
     else:
-        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История статусов</h3><div class="hint">История пока пустая.</div></div>'
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">Proof Timeline</h3><div class="hint">История пока пустая.</div></div>'
 
     photos_html = ""
     if photos:
@@ -5211,7 +5438,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
             dt = html.escape(((p["created_at"] or "")[:16]).replace("T", " "))
             comment = html.escape(p["comment"] or "Фото груза")
             items.append(f'<div class="photo">📷 {comment}<br><span>{dt}</span></div>')
-        photos_html = '<div class="smart"><h3>Фото груза</h3><div class="photos">' + "".join(items) + "</div></div>"
+        photos_html = '<div class="smart"><h3>Доказательства склада</h3><div class="photos">' + "".join(items) + "</div></div>"
 
     support_status = "нет открытых обращений"
     if tickets:
@@ -5219,7 +5446,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         support_status = f"{open_count} открытых обращений" if open_count else "обращения закрыты"
 
     support_button = ""
-    if trust["show_support"]:
+    if trust["show_support"] or promise["score"] < 65:
         support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Проверить у менеджера</a>'
 
     trust_html = f"""
@@ -5235,14 +5462,17 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
       </div>
     """
 
-    smart_summary = f"""
+    promise_html = promise_os_html(order, promise)
+
+    promise_summary = f"""
       <div class="smart">
-        <h3>Smart-карточка груза</h3>
-        <div class="hint">Клиент видит не просто статус, а понятное объяснение, следующий этап и нужно ли писать менеджеру.</div>
+        <h3>Promise Card</h3>
+        <div class="hint">Это не просто трекер. Это карточка обещания: что можно обещать клиенту, где есть риск и какие доказательства уже есть.</div>
         <div class="grid" style="margin-top:12px;">
           <div class="item"><div class="label">Обращения</div><div class="value">{html.escape(support_status)}</div></div>
           <div class="item"><div class="label">Просмотров ссылки</div><div class="value">{views['total']}</div></div>
-          <div class="item"><div class="label">Маршрут SmartFlow</div><div class="value">{html.escape(trust['route_name'])}</div></div>
+          <div class="item"><div class="label">Risk Gate</div><div class="value">{html.escape(promise['gate'])}</div></div>
+          <div class="item"><div class="label">Dispute Shield</div><div class="value">история зафиксирована</div></div>
         </div>
       </div>
     """
@@ -5256,8 +5486,9 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         <div class="item"><div class="label">Вес</div><div class="value">{html.escape(str(order['weight'] or '—'))} кг</div></div>
         <div class="item"><div class="label">Последнее обновление</div><div class="value">{updated or '—'}</div></div>
       </div>
+      {promise_html}
       {trust_html}
-      {smart_summary}
+      {promise_summary}
       {photos_html}
       {history_html}
       <form class="form" method="get" action="/track" style="margin-top:20px;">
@@ -5265,7 +5496,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         <button type="submit">Проверить</button>
       </form>
     """
-    return _web_response(_track_layout(f"Груз {order['tracking_code']}", content))
+    return _web_response(_track_layout(f"CargoPromise {order['tracking_code']}", content))
 
 
 async def api_track_order(request: web.Request) -> web.Response:
@@ -5279,18 +5510,18 @@ async def api_track_order(request: web.Request) -> web.Response:
     tickets = data.get("tickets", [])
     trust = trustflow_info(order)
     views = await track_view_stats(order["tracking_code"])
+    promise = promise_os_profile(order, history, photos, tickets, views)
     return web.json_response({
         "ok": True,
+        "product": "CargoPromise OS",
         "tracking_code": order["tracking_code"],
         "status": order["status"],
+        "promise": promise,
         "trustflow": trust,
         "from_country": order["from_country"],
         "to_city": order["to_city"],
         "cargo_type": order["cargo_type"],
         "weight": order["weight"],
-        "price": order["price"],
-        "paid_amount": order["paid_amount"],
-        "payment_status": order["payment_status"],
         "updated_at": order["updated_at"],
         "history": [{"status": h["status"], "comment": h["comment"], "created_at": h["created_at"]} for h in history],
         "photos_count": len(photos),
@@ -5483,6 +5714,8 @@ async def start_health_server(bot: Bot) -> None:
     app.router.add_get("/", landing_page)
     app.router.add_get("/track", track_page)
     app.router.add_get("/track/{code}", track_code_page)
+    app.router.add_get("/promise/{code}", track_code_page)
+    app.router.add_get("/passport/{code}", track_code_page)
     app.router.add_get("/api/track/{code}", api_track_order)
     app.router.add_get("/demo-pay/{code}", demo_payment_page)
     app.router.add_get("/demo-pay/{code}/checkout/{provider}", demo_payment_checkout_page)
