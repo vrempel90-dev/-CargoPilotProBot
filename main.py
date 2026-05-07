@@ -358,14 +358,18 @@ def provider_info(provider: str) -> dict:
     return DEMO_PAYMENT_PROVIDERS.get((provider or "").strip().lower(), DEMO_PAYMENT_PROVIDERS["kaspi"])
 
 
-def status_notify_text(code: str, status: str, comment: str = "") -> str:
-    text = (
-        f"📦 Статус груза <b>{safe(code)}</b> обновлён.\n"
-        f"Новый статус: <b>{safe(status)}</b>"
+def status_notify_text(code: str, status: str = "", comment: str = "") -> str:
+    """Короткое уведомление без раскрытия статуса в Telegram.
+
+    Подробности специально вынесены на веб-трекер:
+    статус, объяснение, следующий этап, задержка и история.
+    Так сайт отслеживания становится главным источником информации,
+    а Telegram не дублирует весь трекер сообщениями.
+    """
+    return (
+        f"📦 Есть обновление по грузу <b>{safe(code)}</b>.\n\n"
+        "Откройте трекер, чтобы посмотреть статус, следующий этап и историю."
     )
-    if comment:
-        text += f"\n{safe(comment)}"
-    return text
 
 
 def client_keyboard() -> ReplyKeyboardMarkup:
