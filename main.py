@@ -338,14 +338,14 @@ def track_url(code: str | None = None) -> str:
     ссылку и открывает статус груза в браузере.
     """
     if code:
-        return f"{PUBLIC_BASE_URL}/track/{str(code).strip().upper()}"
+        return f"{PUBLIC_BASE_URL}/passport/{str(code).strip().upper()}"
     return f"{PUBLIC_BASE_URL}/track"
 
 
 def track_button(code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔎 Отследить груз", url=track_url(code))],
+            [InlineKeyboardButton(text="🧾 Открыть Promise Passport", url=track_url(code))],
         ]
     )
 
@@ -355,7 +355,7 @@ def payment_page_url(code: str) -> str:
 
 
 def track_pay_button(code: str, debt: float = 0) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(text="🔎 Отследить груз", url=track_url(code))]]
+    buttons = [[InlineKeyboardButton(text="🧾 Открыть Promise Passport", url=track_url(code))]]
     if DEMO_PAYMENT_ENABLED and debt > 0:
         buttons.append([InlineKeyboardButton(text="💳 Оплатить", url=payment_page_url(code))])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -522,6 +522,7 @@ def status_keyboard(order_id: int, statuses: Optional[list[str]] = None) -> Inli
 def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🧭 Promise Card", callback_data=f"promise_card:{order_id}")],
             [InlineKeyboardButton(text="🤖 Включить автостатусы", callback_data=f"auto_enable:{order_id}")],
             [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="✅ Доставлен", callback_data=f"st:{order_id}:доставлен")],
@@ -531,13 +532,11 @@ def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 
 def new_order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    """Кнопки для новой заявки до оплаты.
-
-    Автостатусы специально не показываем, чтобы логика была:
-    заявка → оплата → уведомление админу → админ включает автостатусы.
-    """
+    """Кнопки для новой заявки до оплаты."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="🧭 Promise Card", callback_data=f"promise_card:{order_id}")],
+            [InlineKeyboardButton(text="💳 Напомнить об оплате", callback_data=f"pay_remind:{order_id}")],
             [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"st:{order_id}:проблема")],
         ]
@@ -2411,7 +2410,7 @@ def admin_payment_notify_text(order: aiosqlite.Row, provider: str, amount: float
         f"Статус оплаты: <b>{safe(order['payment_status'] or 'оплачено')}</b>\n"
         f"Всего оплачено: <b>{safe(str(order['paid_amount'] or 0))} {safe(CURRENCY)}</b>\n"
         f"Payment ID: <code>{safe(payment_id or 'demo')}</code>\n\n"
-        "Клиент оплатил груз. Теперь можно включить автостатусы одной кнопкой."
+        "Клиент оплатил груз. Теперь можно открыть Promise Card и включить автостатусы одной кнопкой."
     )
 
 
@@ -2476,8 +2475,54 @@ def format_short_order(order: aiosqlite.Row) -> str:
     )
 
 
+def client_promise_created_text(order: aiosqlite.Row, estimate: Optional[float] = None, order_name: str = "Заявка") -> str:
+    safe_window, start_rule, warning = promise_route_window(order)
+    estimate_line = f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n" if estimate is not None else ""
+    return (
+        f"✅ {safe(order_name)} принята в CargoPromise OS.\n\n"
+        f"Номер груза: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"{estimate_line}\n"
+        f"<b>Безопасное обещание:</b> {safe(safe_window)}\n"
+        f"<b>Срок считается:</b> {safe(start_rule)}\n\n"
+        "Дальше логика такая:\n"
+        "1. Вы оплачиваете доставку через кнопку <b>💳 Оплатить доставку</b>.\n"
+        "2. Админ получает уведомление об оплате.\n"
+        "3. После этого админ включает автостатусы.\n"
+        "4. Все подробности будут в Promise Passport.\n\n"
+        f"<i>{safe(warning)}</i>"
+    )
+
+
+async def admin_promise_new_order_text(order: aiosqlite.Row) -> str:
+    data = await smart_cargo_card_data(order["id"])
+    views = await track_view_stats(order["tracking_code"])
+    profile = promise_os_profile(
+        order,
+        data.get("history", []),
+        data.get("photos", []),
+        data.get("tickets", []),
+        views,
+    )
+    return (
+        "<b>🆕 Новая заявка · CargoPromise OS</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"Клиент: {safe(order['customer_name'])}, {safe(order['phone'])}\n"
+        f"Маршрут: {safe(order['from_country'])} → {safe(order['to_city'])}\n"
+        f"Товар: {safe(order['cargo_type'])}\n"
+        f"Вес: {safe(order['weight'])} кг\n\n"
+        f"<b>Risk Gate:</b> {safe(profile['gate'])}\n"
+        f"<b>TrustScore:</b> {profile['score']}/100\n"
+        f"<b>Anxiety Score:</b> {profile['anxiety']}/100\n"
+        f"<b>Безопасное обещание:</b> {safe(profile['safe_window'])}\n"
+        f"<b>Срок считать:</b> {safe(profile['promise_start'])}\n\n"
+        "Автостатусы пока не включены. Сначала клиент оплачивает, потом админу придёт уведомление с кнопкой включения автостатусов."
+    )
+
+
 async def show_order_to_admin(bot: Bot, order: aiosqlite.Row) -> None:
-    text = "<b>🆕 Новая заявка</b>\n\n" + format_order(order)
+    text = await admin_promise_new_order_text(order)
     await notify_admins(bot, text, new_order_actions_keyboard(order["id"]))
 
 
@@ -3479,10 +3524,7 @@ async def cargo_phone(message: Message, state: FSMContext, bot: Bot):
     rate, estimate = await estimate_delivery_price_db(data["from_country"], float(data["weight"]), float(data["volume"]))
     await state.clear()
     await message.answer(
-        f"✅ Заявка создана.\n\n"
-        f"Ваш номер груза: <b>{safe(order['tracking_code'])}</b>\n"
-        f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n"
-        "Нажмите кнопку ниже, чтобы отследить груз.",
+        client_promise_created_text(order, estimate=estimate, order_name="Заявка"),
         reply_markup=track_button(order['tracking_code']),
     )
     await show_order_to_admin(bot, order)
@@ -3654,10 +3696,7 @@ async def buyout_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на выкуп создана.\n\n"
-        f"Номер: <b>{safe(order['tracking_code'])}</b>\n"
-        "Менеджер проверит товар, стоимость и доставку.\n"
-        "Нажмите кнопку ниже, чтобы отследить заявку.",
+        client_promise_created_text(order, estimate=None, order_name="Заявка на выкуп"),
         reply_markup=track_button(order['tracking_code']),
     )
     await show_order_to_admin(bot, order)
@@ -3752,10 +3791,7 @@ async def wholesale_finish(message: Message, state: FSMContext, bot: Bot):
     )
     await state.clear()
     await message.answer(
-        f"✅ Заявка на оптовую доставку создана.\n\n"
-        f"Номер: <b>{safe(order['tracking_code'])}</b>\n"
-        "Менеджер проверит маршрут, документы и тариф.\n"
-        "Нажмите кнопку ниже, чтобы отследить заявку.",
+        client_promise_created_text(order, estimate=None, order_name="Заявка на оптовую доставку"),
         reply_markup=track_button(order['tracking_code']),
     )
     await show_order_to_admin(bot, order)
@@ -5042,6 +5078,42 @@ async def warehouse_orders(message: Message):
 # =========================
 # CALLBACKS
 # =========================
+@router.callback_query(F.data.startswith("promise_card:"))
+async def cb_promise_card(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+
+    data = await smart_cargo_card_data(order_id)
+    views = await track_view_stats(order["tracking_code"])
+    profile = promise_os_profile(
+        order,
+        data.get("history", []),
+        data.get("photos", []),
+        data.get("tickets", []),
+        views,
+    )
+    await call.message.answer(
+        f"<b>🧭 Promise Card</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Promise ID: <code>{safe(promise_id(order))}</code>\n\n"
+        f"Risk Gate: <b>{safe(profile['gate'])}</b>\n"
+        f"TrustScore: <b>{profile['score']}/100</b>\n"
+        f"Anxiety Score: <b>{profile['anxiety']}/100</b>\n\n"
+        f"Безопасное обещание: <b>{safe(profile['safe_window'])}</b>\n"
+        f"Срок считать: <b>{safe(profile['promise_start'])}</b>\n"
+        f"Что нельзя обещать: {safe(profile['warning'])}\n\n"
+        f"Promise Passport: {safe(track_url(order['tracking_code']))}",
+        reply_markup=order_actions_keyboard(order_id) if await order_payment_confirmed(order) else new_order_actions_keyboard(order_id),
+    )
+    await call.answer("Promise Card открыт")
+
+
 @router.callback_query(F.data == "admin_back")
 async def cb_admin_back(call: CallbackQuery):
     if not call.from_user or not is_admin(call.from_user.id):
