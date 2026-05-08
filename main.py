@@ -520,9 +520,16 @@ def status_keyboard(order_id: int, statuses: Optional[list[str]] = None) -> Inli
 
 
 def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Кнопки после оплаты.
+
+    Теперь задействованы две главные кнопки продукта:
+    1) 🧭 Promise OS по заявке — анализ риска/доверия.
+    2) 🔐 Promise Lock / срок — предлагает безопасные даты и сохраняет обещание.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🧭 Promise Card", callback_data=f"promise_card:{order_id}")],
+            [InlineKeyboardButton(text="🧭 Promise OS по заявке", callback_data=f"promise_card:{order_id}")],
+            [InlineKeyboardButton(text="🔐 Promise Lock / срок", callback_data=f"promise_lock_order:{order_id}")],
             [InlineKeyboardButton(text="🤖 Включить автостатусы", callback_data=f"auto_enable:{order_id}")],
             [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
             [InlineKeyboardButton(text="✅ Доставлен", callback_data=f"st:{order_id}:доставлен")],
@@ -532,13 +539,14 @@ def order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
 
 
 def new_order_actions_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    """Кнопки для новой заявки до оплаты."""
+    """До оплаты админ заявку не получает.
+
+    Эта клавиатура оставлена только как резерв.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🧭 Promise Card", callback_data=f"promise_card:{order_id}")],
+            [InlineKeyboardButton(text="🧭 Promise OS по заявке", callback_data=f"promise_card:{order_id}")],
             [InlineKeyboardButton(text="💳 Напомнить об оплате", callback_data=f"pay_remind:{order_id}")],
-            [InlineKeyboardButton(text="🔁 Изменить статус", callback_data=f"open_status:{order_id}")],
-            [InlineKeyboardButton(text="⚠️ Проблема", callback_data=f"st:{order_id}:проблема")],
         ]
     )
 
@@ -871,6 +879,16 @@ async def init_db() -> None:
                 created_at TEXT,
                 paid_at TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS promise_terms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id INTEGER UNIQUE,
+                promised_days INTEGER,
+                promise_text TEXT,
+                created_by INTEGER,
+                created_at TEXT,
+                updated_at TEXT
+            );
             """
         )
         for sql in [
@@ -1137,6 +1155,81 @@ def parse_window_days(window: str) -> tuple[int, int]:
     return nums[0], nums[1]
 
 
+def fmt_date(dt: datetime) -> str:
+    return dt.strftime("%d.%m.%Y")
+
+
+def delivery_date_after(days: int) -> str:
+    return fmt_date(datetime.now(timezone.utc) + timedelta(days=days))
+
+
+def safe_delivery_date_window(order: aiosqlite.Row) -> dict:
+    """Безопасные даты доставки, которые Promise Lock предлагает админу.
+
+    Важно: это не точное обещание "будет в этот день", а безопасная рамка,
+    чтобы меньше было споров между клиентом и админом.
+    """
+    safe_window, start_rule, warning = promise_route_window(order)
+    min_days, max_days = parse_window_days(safe_window)
+    if min_days <= 0:
+        min_days, max_days = 7, 12
+    if max_days < min_days:
+        max_days = min_days
+
+    recommended_days = max_days
+    buffer_days = max_days + 2
+    calm_days = max_days + 4
+
+    return {
+        "safe_window": safe_window,
+        "start_rule": start_rule,
+        "warning": warning,
+        "min_days": min_days,
+        "max_days": max_days,
+        "recommended_days": recommended_days,
+        "buffer_days": buffer_days,
+        "calm_days": calm_days,
+        "min_date": delivery_date_after(min_days),
+        "max_date": delivery_date_after(max_days),
+        "recommended_date": delivery_date_after(recommended_days),
+        "buffer_date": delivery_date_after(buffer_days),
+        "calm_date": delivery_date_after(calm_days),
+    }
+
+
+def safe_delivery_dates_text(order: aiosqlite.Row) -> str:
+    d = safe_delivery_date_window(order)
+    return (
+        f"Безопасная рамка: <b>{safe(d['safe_window'])}</b> "
+        f"примерно <b>{safe(d['min_date'])}–{safe(d['max_date'])}</b>\n"
+        f"Рекомендуемая дата: <b>{safe(d['recommended_date'])}</b>\n"
+        f"С запасом: <b>{safe(d['buffer_date'])}</b>\n"
+        f"Максимально спокойно: <b>{safe(d['calm_date'])}</b>"
+    )
+
+
+def safe_delivery_dates_keyboard(order_id: int, order: aiosqlite.Row) -> InlineKeyboardMarkup:
+    d = safe_delivery_date_window(order)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(
+                text=f"✅ Рекомендовать {d['recommended_date']}",
+                callback_data=f"safe_term:{order_id}:{d['recommended_days']}",
+            )],
+            [InlineKeyboardButton(
+                text=f"🛡 С запасом {d['buffer_date']}",
+                callback_data=f"safe_term:{order_id}:{d['buffer_days']}",
+            )],
+            [InlineKeyboardButton(
+                text=f"🔒 Максимально спокойно {d['calm_date']}",
+                callback_data=f"safe_term:{order_id}:{d['calm_days']}",
+            )],
+            [InlineKeyboardButton(text="✍️ Ввести срок вручную", callback_data=f"manual_term:{order_id}")],
+            [InlineKeyboardButton(text="🧭 Promise OS по заявке", callback_data=f"promise_card:{order_id}")],
+        ]
+    )
+
+
 def promise_lock_assessment(order: aiosqlite.Row, promised_days: int) -> dict:
     """Promise Lock не даёт менеджеру обещать опасный срок."""
     safe_window, start_rule, warning = promise_route_window(order)
@@ -1160,8 +1253,10 @@ def promise_lock_assessment(order: aiosqlite.Row, promised_days: int) -> dict:
         reason = f"Срок {promised_days} дней не конфликтует с безопасной рамкой {safe_window}."
         allowed = True
 
+    delivery_date = delivery_date_after(promised_days)
+    safe_dates = safe_delivery_date_window(order)
     client_phrase = (
-        f"Ориентировочный срок доставки: {safe_window}. "
+        f"Ориентировочный срок доставки: до {delivery_date}. "
         f"Срок считается {start_rule}. "
         f"{warning}"
     )
@@ -1176,17 +1271,24 @@ def promise_lock_assessment(order: aiosqlite.Row, promised_days: int) -> dict:
         "warning": warning,
         "client_phrase": client_phrase,
         "promised_days": promised_days,
+        "delivery_date": delivery_date,
+        "recommended_date": safe_dates["recommended_date"],
+        "buffer_date": safe_dates["buffer_date"],
+        "calm_date": safe_dates["calm_date"],
     }
 
 
 def format_promise_lock_result(order: aiosqlite.Row, result: dict) -> str:
     return (
         f"<b>🔐 Promise Lock</b>\n\n"
-        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n"
         f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
         f"Маршрут: {safe(order['from_country'] or '—')} → {safe(order['to_city'] or '—')}\n\n"
         f"{safe(result['title'])}\n"
         f"{safe(result['reason'])}\n\n"
+        f"<b>Дата, которую можно обещать:</b> до <b>{safe(result.get('delivery_date', '—'))}</b>\n"
+        f"<b>Рекомендованная дата:</b> {safe(result.get('recommended_date', '—'))}\n"
+        f"<b>Дата с запасом:</b> {safe(result.get('buffer_date', '—'))}\n\n"
         f"<b>Что лучше писать клиенту:</b>\n"
         f"{safe(result['client_phrase'])}"
     )
@@ -1320,7 +1422,7 @@ def promise_os_html(order: aiosqlite.Row, profile: dict) -> str:
           <div>
             <div class="promise-kicker">CargoPromise Trust Method</div>
             <div class="promise-title">{emoji} {html.escape(profile['client_label'])}</div>
-            <div class="hint">Promise ID: <b>{html.escape(profile['promise_id'])}</b></div>
+            <div class="hint">Номер обещания: <b>{html.escape(profile['promise_id'])}</b></div>
           </div>
           <div class="score">{profile['score']}<span>/100</span></div>
         </div>
@@ -1341,6 +1443,59 @@ def promise_os_html(order: aiosqlite.Row, profile: dict) -> str:
           </div>
         </div>
         <div class="hint"><b>Что нельзя обещать:</b> {html.escape(profile['warning'])}</div>
+      </div>
+    """
+
+
+def client_public_status(profile: dict) -> tuple[str, str, str]:
+    """Публичная формулировка для клиента.
+
+    Важно: клиенту не показываем внутренние метрики Anxiety Score, Risk Gate,
+    TrustScore и технические причины. Это остаётся админу.
+    """
+    level = profile.get("level", "green")
+    if level == "green":
+        return "green", "🟢 Всё по плану", "По грузу нет критичных предупреждений. Следите за обновлениями в этом паспорте."
+    if level == "yellow":
+        return "yellow", "🟡 Есть ожидание по обновлению", "Груз в работе. Если обновление задержится, менеджер проверит информацию."
+    return "red", "🔴 Нужна проверка менеджером", "По грузу есть момент, который лучше проверить с менеджером."
+
+
+def client_delivery_date_text(order: aiosqlite.Row, delivery_term: Optional[aiosqlite.Row]) -> str:
+    if delivery_term:
+        return delivery_term_text(delivery_term)
+    d = safe_delivery_date_window(order)
+    return f"ориентир {d['min_date']}–{d['max_date']}"
+
+
+def client_promise_passport_html(order: aiosqlite.Row, profile: dict, delivery_term: Optional[aiosqlite.Row]) -> str:
+    level, title, description = client_public_status(profile)
+    d = safe_delivery_date_window(order)
+    date_text = client_delivery_date_text(order, delivery_term)
+    start_rule = html.escape(profile.get("promise_start") or d["start_rule"])
+    return f"""
+      <div class="promise {html.escape(level)}">
+        <div class="promise-head">
+          <div>
+            <div class="promise-kicker">Паспорт груза</div>
+            <div class="promise-title">{html.escape(title)}</div>
+            <div class="hint">Номер груза: <b>{html.escape(str(order['tracking_code']))}</b></div>
+          </div>
+        </div>
+        <div class="hint" style="margin-top:10px;">{html.escape(description)}</div>
+        <div class="grid" style="margin-top:14px;">
+          <div class="item"><div class="label">Ориентировочная доставка</div><div class="value">{html.escape(date_text)}</div></div>
+          <div class="item"><div class="label">Срок считается</div><div class="value">{start_rule}</div></div>
+          <div class="item"><div class="label">Безопасная рамка</div><div class="value">{html.escape(d['safe_window'])}</div></div>
+          <div class="item"><div class="label">Статус проверки</div><div class="value">{html.escape('по маршруту всё нормально' if level == 'green' else 'нужна дополнительная проверка' if level == 'red' else 'ожидаем обновление')}</div></div>
+        </div>
+        <div class="smart" style="margin-top:14px;">
+          <h3>Что важно знать</h3>
+          <div class="hint">
+            Дата указана как безопасный ориентир, чтобы не обещать клиенту слишком короткий срок.
+            Точная дата может зависеть от оплаты, приёмки на склад, партии и маршрута.
+          </div>
+        </div>
       </div>
     """
 
@@ -1403,6 +1558,7 @@ def format_promise_os_report(data: dict) -> str:
             lines.append(f"— <b>{safe(order['tracking_code'])}</b>: TrustScore {p['score']}/100, Anxiety {p['anxiety']}/100 · {safe(p['gate'])}")
     lines.append("")
     lines.append("Смысл: контролировать обещания до того, как они превратятся в спор, возврат или потерю клиента.")
+    lines.append("После оплаты заявки используйте: 🧭 Promise OS по заявке → 🔐 Promise Lock / срок → 🤖 автостатусы.")
     return "\n".join(lines)
 
 
@@ -1416,6 +1572,8 @@ async def enable_auto_status_for_order(order_id: int, actor_id: int = 0) -> Opti
     if not order:
         return None
     if not await order_payment_confirmed(order):
+        return None
+    if not await order_has_delivery_term(order_id):
         return None
     route_key = choose_auto_route(order["from_country"] or "", order["to_city"] or "")
     async with get_db() as db:
@@ -1874,7 +2032,7 @@ async def create_order(
             (
                 order_id,
                 "новая заявка",
-                f"Заявка создана клиентом. Promise ID: CP-{datetime.now().strftime('%y%m%d')}-{order_id:05d}. Автостатусы ждут оплаты и включения админом.",
+                f"Заявка создана клиентом. Номер обещания: CP-{datetime.now().strftime('%y%m%d')}-{order_id:05d}. Автостатусы ждут оплаты и включения админом.",
                 user_id,
                 now_iso(),
             ),
@@ -2479,17 +2637,18 @@ def client_promise_created_text(order: aiosqlite.Row, estimate: Optional[float] 
     safe_window, start_rule, warning = promise_route_window(order)
     estimate_line = f"Предварительная стоимость: около <b>{estimate} {safe(CURRENCY)}</b>\n" if estimate is not None else ""
     return (
-        f"✅ {safe(order_name)} принята в CargoPromise OS.\n\n"
+        f"✅ {safe(order_name)} сохранена в CargoPromise OS.\n\n"
         f"Номер груза: <b>{safe(order['tracking_code'])}</b>\n"
-        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n"
         f"{estimate_line}\n"
         f"<b>Безопасное обещание:</b> {safe(safe_window)}\n"
         f"<b>Срок считается:</b> {safe(start_rule)}\n\n"
-        "Дальше логика такая:\n"
-        "1. Вы оплачиваете доставку через кнопку <b>💳 Оплатить доставку</b>.\n"
-        "2. Админ получает уведомление об оплате.\n"
-        "3. После этого админ включает автостатусы.\n"
-        "4. Все подробности будут в Promise Passport.\n\n"
+        "<b>Важно:</b> заявка уйдёт админу только после оплаты.\n\n"
+        "Дальше:\n"
+        "1. Нажмите <b>💳 Оплатить доставку</b>.\n"
+        "2. После оплаты админ получит вашу заявку.\n"
+        "3. Админ поставит срок доставки.\n"
+        "4. После этого админ включит автостатусы.\n\n"
         f"<i>{safe(warning)}</i>"
     )
 
@@ -2507,7 +2666,7 @@ async def admin_promise_new_order_text(order: aiosqlite.Row) -> str:
     return (
         "<b>🆕 Новая заявка · CargoPromise OS</b>\n\n"
         f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
-        f"Promise ID: <code>{safe(promise_id(order))}</code>\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n"
         f"Клиент: {safe(order['customer_name'])}, {safe(order['phone'])}\n"
         f"Маршрут: {safe(order['from_country'])} → {safe(order['to_city'])}\n"
         f"Товар: {safe(order['cargo_type'])}\n"
@@ -2522,8 +2681,90 @@ async def admin_promise_new_order_text(order: aiosqlite.Row) -> str:
 
 
 async def show_order_to_admin(bot: Bot, order: aiosqlite.Row) -> None:
+    """Резерв. В новой логике заявка админу приходит только после оплаты."""
     text = await admin_promise_new_order_text(order)
     await notify_admins(bot, text, new_order_actions_keyboard(order["id"]))
+
+
+async def get_promise_term(order_id: int) -> Optional[aiosqlite.Row]:
+    async with get_db() as db:
+        return await db_fetchone(db, "SELECT * FROM promise_terms WHERE order_id=?", (order_id,))
+
+
+async def set_promise_term(order_id: int, days: int, actor_id: int) -> Optional[aiosqlite.Row]:
+    order = await get_order(order_id)
+    if not order:
+        return None
+    safe_window, start_rule, warning = promise_route_window(order)
+    promise_text = (
+        f"Срок доставки, поставленный админом: {days} дней. "
+        f"Срок считается {start_rule}. "
+        f"Безопасная рамка по маршруту: {safe_window}. "
+        f"{warning}"
+    )
+    now = now_iso()
+    async with get_db() as db:
+        await db.execute(
+            """
+            INSERT INTO promise_terms (order_id, promised_days, promise_text, created_by, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(order_id) DO UPDATE SET
+                promised_days=excluded.promised_days,
+                promise_text=excluded.promise_text,
+                created_by=excluded.created_by,
+                updated_at=excluded.updated_at
+            """,
+            (order_id, days, promise_text, actor_id, now, now),
+        )
+        await db.execute(
+            "INSERT INTO status_history (order_id, status, comment, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+            (order_id, order["status"] or "новая заявка", f"Админ поставил срок доставки: {days} дней", actor_id, now),
+        )
+        await db.commit()
+    return await get_promise_term(order_id)
+
+
+async def order_has_delivery_term(order_id: int) -> bool:
+    term = await get_promise_term(order_id)
+    return bool(term and int(term["promised_days"] or 0) > 0)
+
+
+def delivery_term_text(term: Optional[aiosqlite.Row]) -> str:
+    if not term:
+        return "не поставлен"
+    days = int(term["promised_days"] or 0)
+    # Дата считается от сегодняшнего дня в демо-логике. Для реального внедрения
+    # можно считать от даты приёмки на склад.
+    return f"{days} дней · до {delivery_date_after(days)}"
+
+
+async def admin_paid_order_text(order: aiosqlite.Row, provider: str, amount: float, payment_id: str = "") -> str:
+    info = provider_info(provider)
+    data = await smart_cargo_card_data(order["id"])
+    views = await track_view_stats(order["tracking_code"])
+    profile = promise_os_profile(order, data.get("history", []), data.get("photos", []), data.get("tickets", []), views)
+    return (
+        "<b>💳 Оплата прошла · новая заявка для админа</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n"
+        f"Клиент: {safe(order['customer_name'])}, {safe(order['phone'])}\n"
+        f"Маршрут: {safe(order['from_country'])} → {safe(order['to_city'])}\n"
+        f"Товар: {safe(order['cargo_type'])}\n"
+        f"Вес: {safe(order['weight'])} кг\n\n"
+        f"Банк: <b>{safe(info['label'])}</b>\n"
+        f"Сумма оплаты: <b>{amount:g} {safe(CURRENCY)}</b>\n"
+        f"Payment ID: <code>{safe(payment_id or 'demo')}</code>\n\n"
+        f"<b>Risk Gate:</b> {safe(profile['gate'])}\n"
+        f"<b>TrustScore:</b> {profile['score']}/100\n"
+        f"<b>Anxiety Score:</b> {profile['anxiety']}/100\n"
+        f"<b>Безопасное обещание:</b> {safe(profile['safe_window'])}\n"
+        f"<b>Срок считать:</b> {safe(profile['promise_start'])}\n"
+        f"{safe_delivery_dates_text(order)}\n\n"
+        "<b>Что делать админу:</b>\n"
+        "1. Нажмите <b>🧭 Promise OS по заявке</b> — посмотрите риск и TrustScore.\n"
+        "2. Нажмите <b>🔐 Promise Lock / срок</b> — выберите безопасную дату доставки.\n"
+        "3. После этого нажмите <b>🤖 Включить автостатусы</b>."
+    )
 
 
 def format_history(rows: list[aiosqlite.Row]) -> str:
@@ -2683,6 +2924,10 @@ class TrackForm(StatesGroup):
 
 class PromiseLockForm(StatesGroup):
     text = State()
+
+
+class DeliveryTermForm(StatesGroup):
+    days = State()
 
 
 class BuyoutForm(StatesGroup):
@@ -3527,7 +3772,6 @@ async def cargo_phone(message: Message, state: FSMContext, bot: Bot):
         client_promise_created_text(order, estimate=estimate, order_name="Заявка"),
         reply_markup=track_button(order['tracking_code']),
     )
-    await show_order_to_admin(bot, order)
 
 
 @router.message(F.text == "🧮 Рассчитать доставку")
@@ -3699,7 +3943,6 @@ async def buyout_finish(message: Message, state: FSMContext, bot: Bot):
         client_promise_created_text(order, estimate=None, order_name="Заявка на выкуп"),
         reply_markup=track_button(order['tracking_code']),
     )
-    await show_order_to_admin(bot, order)
 
 
 @router.message(F.text == "🏢 Оптовая доставка")
@@ -3794,7 +4037,6 @@ async def wholesale_finish(message: Message, state: FSMContext, bot: Bot):
         client_promise_created_text(order, estimate=None, order_name="Заявка на оптовую доставку"),
         reply_markup=track_button(order['tracking_code']),
     )
-    await show_order_to_admin(bot, order)
 
 
 @router.message(F.text == "⚠️ Жалоба / проблема")
@@ -5078,6 +5320,137 @@ async def warehouse_orders(message: Message):
 # =========================
 # CALLBACKS
 # =========================
+@router.callback_query(F.data.startswith("set_term:"))
+@router.callback_query(F.data.startswith("promise_lock_order:"))
+async def cb_set_delivery_term(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    if not await order_payment_confirmed(order):
+        await call.answer("Сначала должна пройти оплата", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(order_id=order_id)
+    await state.set_state(DeliveryTermForm.days)
+    safe_window, start_rule, warning = promise_route_window(order)
+    await call.message.answer(
+        f"<b>🔐 Promise Lock / безопасные даты</b>\n\n"
+        f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n\n"
+        f"Срок считается: <b>{safe(start_rule)}</b>\n"
+        f"Что нельзя обещать: {safe(warning)}\n\n"
+        f"{safe_delivery_dates_text(order)}\n\n"
+        "Выберите безопасную дату кнопкой ниже или введите срок вручную. "
+        "Слишком короткий срок Promise Lock не сохранит.",
+        reply_markup=safe_delivery_dates_keyboard(order_id, order),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("manual_term:"))
+async def cb_manual_term(call: CallbackQuery, state: FSMContext):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    order_id = int(call.data.split(":", 1)[1])
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    await state.clear()
+    await state.update_data(order_id=order_id)
+    await state.set_state(DeliveryTermForm.days)
+    await call.message.answer(
+        f"Введите срок вручную для <b>{safe(order['tracking_code'])}</b>.\n"
+        "Например: <code>14</code>",
+        reply_markup=admin_keyboard(),
+    )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("safe_term:"))
+async def cb_safe_delivery_term(call: CallbackQuery):
+    if not call.from_user or not is_admin(call.from_user.id):
+        await call.answer("Нет доступа", show_alert=True)
+        return
+    _, order_id_raw, days_raw = call.data.split(":")
+    order_id = int(order_id_raw)
+    days = int(days_raw)
+    order = await get_order(order_id)
+    if not order:
+        await call.answer("Груз не найден", show_alert=True)
+        return
+    if not await order_payment_confirmed(order):
+        await call.answer("Сначала должна пройти оплата", show_alert=True)
+        return
+
+    lock = promise_lock_assessment(order, days)
+    if not lock["allowed"]:
+        await call.message.answer(
+            format_promise_lock_result(order, lock) + "\n\n"
+            "Срок не сохранён. Выберите более безопасную дату.",
+            reply_markup=safe_delivery_dates_keyboard(order_id, order),
+        )
+        await call.answer("Срок рискованный", show_alert=True)
+        return
+
+    term = await set_promise_term(order_id, days, call.from_user.id)
+    await call.message.answer(
+        format_promise_lock_result(order, lock) + "\n\n"
+        f"✅ Безопасная дата сохранена: <b>{delivery_term_text(term)}</b>.\n\n"
+        "Теперь можно включить автостатусы.",
+        reply_markup=order_actions_keyboard(order_id),
+    )
+    await call.answer("Срок сохранён")
+
+
+
+@router.message(DeliveryTermForm.days)
+async def delivery_term_finish(message: Message, state: FSMContext):
+    if not message.from_user or not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    order_id = int(data.get("order_id") or 0)
+    order = await get_order(order_id)
+    if not order:
+        await state.clear()
+        await message.answer("Груз не найден.", reply_markup=admin_keyboard())
+        return
+
+    m = re.search(r"\d+", message.text or "")
+    if not m:
+        await message.answer("Напишите число дней. Например: <code>12</code>", reply_markup=admin_keyboard())
+        return
+    days = int(m.group(0))
+    if days <= 0 or days > 120:
+        await message.answer("Срок должен быть от 1 до 120 дней.", reply_markup=admin_keyboard())
+        return
+
+    lock = promise_lock_assessment(order, days)
+    if not lock["allowed"]:
+        await message.answer(
+            format_promise_lock_result(order, lock) + "\n\n"
+            "Срок не сохранён. Выберите безопасную дату кнопкой ниже или введите срок ещё раз.",
+            reply_markup=safe_delivery_dates_keyboard(order_id, order),
+        )
+        return
+
+    term = await set_promise_term(order_id, days, message.from_user.id)
+    await state.clear()
+    await message.answer(
+        format_promise_lock_result(order, lock) + "\n\n"
+        f"✅ Безопасная дата сохранена: <b>{delivery_term_text(term)}</b>.\n\n"
+        "Теперь можно включить автостатусы.",
+        reply_markup=order_actions_keyboard(order_id),
+    )
+
+
+
 @router.callback_query(F.data.startswith("promise_card:"))
 async def cb_promise_card(call: CallbackQuery):
     if not call.from_user or not is_admin(call.from_user.id):
@@ -5098,13 +5471,16 @@ async def cb_promise_card(call: CallbackQuery):
         data.get("tickets", []),
         views,
     )
+    term = await get_promise_term(order_id)
     await call.message.answer(
-        f"<b>🧭 Promise Card</b>\n\n"
+        f"<b>🧭 Promise OS по заявке</b>\n\n"
         f"Груз: <b>{safe(order['tracking_code'])}</b>\n"
-        f"Promise ID: <code>{safe(promise_id(order))}</code>\n\n"
+        f"Номер обещания: <code>{safe(promise_id(order))}</code>\n\n"
         f"Risk Gate: <b>{safe(profile['gate'])}</b>\n"
         f"TrustScore: <b>{profile['score']}/100</b>\n"
         f"Anxiety Score: <b>{profile['anxiety']}/100</b>\n\n"
+        f"Срок от админа: <b>{safe(delivery_term_text(term))}</b>\n"
+        f"{safe_delivery_dates_text(order)}\n"
         f"Безопасное обещание: <b>{safe(profile['safe_window'])}</b>\n"
         f"Срок считать: <b>{safe(profile['promise_start'])}</b>\n"
         f"Что нельзя обещать: {safe(profile['warning'])}\n\n"
@@ -5173,8 +5549,16 @@ async def cb_auto_enable(call: CallbackQuery):
         await call.answer("Сначала должна пройти оплата", show_alert=True)
         await call.message.answer(
             f"⚠️ Автостатусы для <b>{safe(order['tracking_code'])}</b> пока не включены.\n\n"
-            "Логика такая: клиент оформляет доставку → оплачивает → админу приходит уведомление → только потом админ включает автостатусы.",
+            "Логика такая: клиент оформляет доставку → оплачивает → админу приходит уведомление → админ ставит срок → потом включает автостатусы.",
             reply_markup=admin_keyboard(),
+        )
+        return
+    if not await order_has_delivery_term(order_id):
+        await call.answer("Сначала поставьте срок доставки", show_alert=True)
+        await call.message.answer(
+            f"⏱ Сначала поставьте срок доставки для <b>{safe(order['tracking_code'])}</b>.\n\n"
+            "После срока можно включить автостатусы.",
+            reply_markup=order_actions_keyboard(order_id),
         )
         return
     updated = await enable_auto_status_for_order(order_id, call.from_user.id)
@@ -5560,10 +5944,10 @@ def _track_layout(title: str, content: str) -> str:
     <div class="shell">
       <div class="hero">
         <h1>{company}</h1>
-        <p>CargoPromise OS: Promise ID, Promise Lock, Anxiety Radar и Proof Passport</p>
+        <p>Проверка груза: статус, срок доставки и история</p>
       </div>
       <div class="card">{content}</div>
-      <div class="footer">CargoPromise OS · контроль обещаний и рисков в карго</div>
+      <div class="footer">Паспорт груза · статус, сроки и история</div>
     </div>
   </div>
 </body>
@@ -5614,6 +5998,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
     views = await track_view_stats(order["tracking_code"])
     trust = trustflow_info(order)
     promise = promise_os_profile(order, history, photos, tickets, views)
+    delivery_term = await get_promise_term(order["id"])
 
     status = order["status"] or "новая заявка"
     badge_color = _status_badge_color(status)
@@ -5627,9 +6012,9 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
             st = html.escape(h["status"] or "")
             comment = html.escape(h["comment"] or "")
             rows.append(f'<div class="hrow"><div class="dot"></div><div class="hdate">{dt}</div><div><div class="hstatus">{st}</div><div class="hint">{comment}</div></div></div>')
-        history_html = '<div class="history"><h3 style="margin:0 0 8px;">Proof Timeline</h3><div class="hint">Доказательная история по грузу: что произошло и когда.</div>' + "".join(rows) + "</div>"
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История груза</h3><div class="hint">Здесь фиксируются основные события по грузу.</div>' + "".join(rows) + "</div>"
     else:
-        history_html = '<div class="history"><h3 style="margin:0 0 8px;">Proof Timeline</h3><div class="hint">История пока пустая.</div></div>'
+        history_html = '<div class="history"><h3 style="margin:0 0 8px;">История груза</h3><div class="hint">История пока пустая.</div></div>'
 
     photos_html = ""
     if photos:
@@ -5638,7 +6023,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
             dt = html.escape(((p["created_at"] or "")[:16]).replace("T", " "))
             comment = html.escape(p["comment"] or "Фото груза")
             items.append(f'<div class="photo">📷 {comment}<br><span>{dt}</span></div>')
-        photos_html = '<div class="smart"><h3>Доказательства склада</h3><div class="photos">' + "".join(items) + "</div></div>"
+        photos_html = '<div class="smart"><h3>Фото груза</h3><div class="photos">' + "".join(items) + "</div></div>"
 
     support_status = "нет открытых обращений"
     if tickets:
@@ -5646,8 +6031,8 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         support_status = f"{open_count} открытых обращений" if open_count else "обращения закрыты"
 
     support_button = ""
-    if trust["show_support"] or promise["score"] < 65:
-        support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Проверить у менеджера</a>'
+    if trust["show_support"] or promise["level"] == "red":
+        support_button = f'<a class="support-btn" href="https://t.me/{html.escape(BOT_USERNAME)}?start=track_{html.escape(order["tracking_code"])}">Связаться с менеджером</a>'
 
     trust_html = f"""
       <div class="trust {html.escape(trust['level'])}">
@@ -5662,17 +6047,24 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
       </div>
     """
 
-    promise_html = promise_os_html(order, promise)
+    passport_html = client_promise_passport_html(order, promise, delivery_term)
 
-    promise_summary = f"""
+    delivery_html = f"""
       <div class="smart">
-        <h3>Promise Control Card</h3>
-        <div class="hint">Это не просто трекер. Это цифровой паспорт обещания: что можно обещать, где риск спора и какие доказательства уже собраны.</div>
+        <h3>Срок доставки</h3>
+        <div class="grid" style="margin-top:12px;">
+          <div class="item"><div class="label">Ориентир</div><div class="value">{html.escape(client_delivery_date_text(order, delivery_term))}</div></div>
+          <div class="item"><div class="label">Безопасная рамка</div><div class="value">{html.escape(safe_delivery_date_window(order)['min_date'])}–{html.escape(safe_delivery_date_window(order)['max_date'])}</div></div>
+        </div>
+      </div>
+    """
+
+    service_summary = f"""
+      <div class="smart">
+        <h3>Информация по грузу</h3>
         <div class="grid" style="margin-top:12px;">
           <div class="item"><div class="label">Обращения</div><div class="value">{html.escape(support_status)}</div></div>
-          <div class="item"><div class="label">Просмотров ссылки</div><div class="value">{views['total']}</div></div>
-          <div class="item"><div class="label">Risk Gate</div><div class="value">{html.escape(promise['gate'])}</div></div>
-          <div class="item"><div class="label">Proof Passport</div><div class="value">история зафиксирована</div></div>
+          <div class="item"><div class="label">Просмотров страницы</div><div class="value">{views['total']}</div></div>
         </div>
       </div>
     """
@@ -5686,9 +6078,10 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         <div class="item"><div class="label">Вес</div><div class="value">{html.escape(str(order['weight'] or '—'))} кг</div></div>
         <div class="item"><div class="label">Последнее обновление</div><div class="value">{updated or '—'}</div></div>
       </div>
-      {promise_html}
+      {passport_html}
+      {delivery_html}
       {trust_html}
-      {promise_summary}
+      {service_summary}
       {photos_html}
       {history_html}
       <form class="form" method="get" action="/track" style="margin-top:20px;">
@@ -5696,7 +6089,7 @@ async def render_tracking_result(code: str, request: Optional[web.Request] = Non
         <button type="submit">Проверить</button>
       </form>
     """
-    return _web_response(_track_layout(f"CargoPromise {order['tracking_code']}", content))
+    return _web_response(_track_layout(f"Груз {order['tracking_code']}", content))
 
 
 async def api_track_order(request: web.Request) -> web.Response:
@@ -5822,7 +6215,7 @@ async def demo_payment_success_page(request: web.Request) -> web.Response:
         if bot:
             await notify_admins(
                 bot,
-                admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+                await admin_paid_order_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
                 reply_markup=order_actions_keyboard(updated["id"]),
             )
 
@@ -5884,7 +6277,7 @@ async def api_demo_payment_success(request: web.Request) -> web.Response:
         if bot:
             await notify_admins(
                 bot,
-                admin_payment_notify_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
+                await admin_paid_order_text(updated, provider_key, amount, payment_result.get("payment_id") or payment_id),
                 reply_markup=order_actions_keyboard(updated["id"]),
             )
 
